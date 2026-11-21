@@ -2835,15 +2835,30 @@ with the token at top 0 that `fork_release` returns once its root token
 has handed back every hold (theorem 33), so outside this statement.
 
 The tokens: `RawLock::lock_held` (`lock.rs`) is `lock` plus a
-`LockHeld` whose `held()` is the lock. The field is private to
+`LockHeld` whose `held()` is the lock, carrying the lock's `Unlocked`
+token, which `RawLock::lock` returns and `unlock_held` hands back to
+the word's invariant. The fields are private to
 `lock.rs`, so outside it only `lock_held` and `Lock::lock_held_perm`
 build a token; the handoff axioms below are the other source.
 
 **Premises beyond the common ones.**
 - *The mutex.* `lock` returns only once this thread holds the lock, and
-  no other thread holds it until `unlock`. This is `RawLock`'s futex
-  contract; Verus does not check it (atomics return any value). The
-  token records the calls; the mutex turns them into exclusive holds.
+  no other thread holds it until `unlock`. Verus checks the word's side
+  of it (#856 step 1): `RawLock::state` is a vstd `PAtomicU32` whose
+  permission lives in the lock's atomic invariant (`lock::RawPred`)
+  with the lock's `Unlocked` token (a vstd `GhostVar` half), exactly
+  while the word is `UNLOCKED`. The exchange that moves the word off
+  `UNLOCKED` (`try_acquire`'s CAS, or `lock_slow`'s `swap(CONTENDED)`
+  returning `UNLOCKED`) takes the token out, `release`'s swap back to
+  `UNLOCKED` puts it back, and a `LockHeld` (or a guard) carries it
+  (its type invariant: the token is its lock's). So outside the fork
+  window a token is the one the word's history gave. Still premised:
+  vstd's `PAtomicU32` (each operation one `SeqCst` atomic operation on
+  the word, and one permission per atomic), and in the fork window
+  `lock::axiom_window_served`, which gives the acquisition the window
+  serves a second token standing for the prepare handler's hold (called
+  once, on that path; `lock::tests::permission_axioms_are_called_only_at_acquisitions`).
+  The cell's permission is still `lock::axiom_acquired`'s.
 - *The handoff* (`axiom_fork_resumed_state`, `api/mod.rs`, and
   `axiom_fork_resumed`; axioms). Ghost state does not cross the
   C calls, so the hold `fork_prepare` ends with is restated where the
@@ -6737,7 +6752,9 @@ states its rank's range (`rank_sets(0) <= rank < rank_sets(0x1_0000)`).
   (`axiom_arenas_assemble` requires the creation lock's rank that
   `Arenas::type_inv` states).
 - *The mutex*, as for fork safety: `lock` returns only once this thread
-  holds the lock.
+  holds the lock (the word's side checked through the lock's token,
+  `lock::RawPred`; the fork window's served acquisition premised,
+  `lock::axiom_window_served`).
 
 **Where the statement is weaker than the code.**
 - Partial correctness and per-thread: the theorem rules out circular

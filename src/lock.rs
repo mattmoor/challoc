@@ -15,11 +15,17 @@
 //!
 //! Nothing on the `malloc`/`free` fast path takes a lock.
 
+use crate::sync::patomic::{PAtomicU32, PermissionU32};
 use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use vstd::cell::pcell::{PCell, PointsTo};
+use vstd::invariant::{AtomicInvariant, InvariantPredicate};
 use vstd::prelude::*;
+use vstd::resource::Loc;
+use vstd::resource::ghost_var::GhostVar;
+#[cfg(verus_keep_ghost)]
+use vstd::resource::ghost_var::GhostVarAuth;
 
 verus! {
 
@@ -45,15 +51,74 @@ const SPINS: u32 = 100;
 
 /// The bare mutex word. Use [`Lock`] when there is data to protect; use this
 /// directly only where the data is elsewhere (fork handlers, state machines).
+///
+/// The word is a vstd `PAtomicU32` (whose operations are `SeqCst`), and
+/// its permission lives in the lock's atomic invariant ([`RawPred`]),
+/// with the lock's [`Unlocked`] token exactly while the word is
+/// `UNLOCKED`. An acquisition is the operation that moves the word off
+/// `UNLOCKED`, so it takes the token out; the release's swap back to
+/// `UNLOCKED` puts it back. A holder's [`LockHeld`] carries the token, so
+/// a hold is one the word's history gives, not one a caller claims.
 #[cfg_attr(not(verus_keep_ghost), repr(transparent))]
 pub struct RawLock {
-    state: AtomicU32,
+    state: PAtomicU32,
     /// Ghost: the lock's rank in the lock order ([`LockOrder`]), fixed at
     /// creation. Verus-only, as is dropping `repr(transparent)` there:
     /// `repr(transparent)` rejects a `Ghost` field (its fields are
     /// private), and ordinary builds keep the one-word struct as it is.
     #[cfg(verus_keep_ghost)]
     rank: Ghost<int>,
+    /// Ghost: the word's invariant ([`RawPred`]), keyed by the word's
+    /// identity and the location of the lock's token. Verus-only, as
+    /// `rank` is.
+    #[cfg(verus_keep_ghost)]
+    inv: Tracked<RawInv>,
+}
+
+/// The lock's token, one per lock: a half of a vstd ghost variable at
+/// the lock's [`RawLock::token_loc`], at `false`. The word's invariant
+/// holds it while the word is `UNLOCKED` ([`RawPred`]); otherwise one
+/// holder has it (in its [`LockHeld`] or guard). The other half
+/// ([`GhostVarAuth`]) is the lock's creator's, unused for now.
+pub type Unlocked = GhostVar<bool>;
+
+/// What a lock's word invariant is about: the word's identity and the
+/// location of its [`Unlocked`] token.
+// Ghost: ordinary builds keep the type but erase the code that reads it.
+#[allow(dead_code)]
+pub type RawKey = (int, Loc);
+
+/// What a lock's word invariant holds: the word's permission and, while
+/// the word is `UNLOCKED`, the lock's token.
+// Ghost: ordinary builds keep the type but erase the code that reads it.
+#[allow(dead_code)]
+pub type RawVal = (PermissionU32, Option<Unlocked>);
+
+/// The word invariant of a [`RawLock`]: the permission is the word's,
+/// the word is one of the three states, and it is `UNLOCKED` exactly when
+/// the invariant holds the lock's token.
+// Ghost: ordinary builds keep the type but erase the code that reads it.
+#[allow(dead_code)]
+pub struct RawPred;
+
+impl InvariantPredicate<RawKey, RawVal> for RawPred {
+    closed spec fn inv(k: RawKey, v: RawVal) -> bool {
+        &&& v.0.id() == k.0
+        &&& v.0.value() <= CONTENDED
+        &&& (v.0.value() == UNLOCKED) == (v.1 is Some)
+        &&& v.1 matches Some(t) ==> t.id() == k.1 && t@ == false
+    }
+}
+
+/// A lock's word invariant.
+// Ghost: ordinary builds keep the type but erase the code that reads it.
+#[allow(dead_code)]
+pub type RawInv = AtomicInvariant<RawKey, RawVal, RawPred>;
+
+/// The namespace of every lock's word invariant ("lock"). Only this
+/// module opens one, and never one inside another.
+pub open spec fn raw_ns() -> int {
+    0x6c6f_636b
 }
 
 impl Default for RawLock {
@@ -73,11 +138,29 @@ impl RawLock {
         ensures
             l.rank() == rank,
     {
+        // The word with its one permission, and the lock's token, both
+        // into the word's invariant, at `UNLOCKED`.
+        let (state, Tracked(perm)) = PAtomicU32::new(UNLOCKED);
+        let tracked (_auth, tok) = GhostVarAuth::<bool>::new(false);
+        let tracked inv = AtomicInvariant::<RawKey, RawVal, RawPred>::new(
+            (state.id(), tok.id()),
+            (perm, Some(tok)),
+            raw_ns(),
+        );
         RawLock {
-            state: AtomicU32::new(UNLOCKED),
+            state,
             #[cfg(verus_keep_ghost)]
             rank: Ghost(rank),
+            #[cfg(verus_keep_ghost)]
+            inv: Tracked(inv),
         }
+    }
+
+    /// The word's invariant is about this lock's word, in [`raw_ns`].
+    #[verifier::type_invariant]
+    closed spec fn wf(&self) -> bool {
+        &&& self.inv@.constant().0 == self.state.id()
+        &&& self.inv@.namespace() == raw_ns()
     }
 
     /// The lock's rank in the lock order.
@@ -85,90 +168,211 @@ impl RawLock {
         self.rank@
     }
 
-    /// The bare CAS from `UNLOCKED` to `LOCKED`.
+    /// The location of the lock's [`Unlocked`] token.
+    pub closed spec fn token_loc(self) -> Loc {
+        self.inv@.constant().1
+    }
+
+    /// `t` is this lock's token.
+    pub open spec fn is_token(self, t: Unlocked) -> bool {
+        t.id() == self.token_loc() && t@ == false
+    }
+
+    /// The bare CAS from `UNLOCKED` to `LOCKED`; on success the lock's
+    /// token, which the word's invariant held while the word was
+    /// `UNLOCKED`.
     #[inline]
-    fn try_acquire(&self) -> bool {
-        self.state
-            .compare_exchange(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
+    fn try_acquire(&self) -> (r: (bool, Tracked<Option<Unlocked>>))
+        ensures
+            r.0 == r.1@ is Some,
+            r.1@ matches Some(t) ==> self.is_token(t),
+    {
+        proof {
+            use_type_invariant(self);
+        }
+        let res;
+        let tracked mut out: Option<Unlocked> = None;
+        vstd::open_atomic_invariant!(self.inv.borrow() => v => {
+            let tracked (mut perm, tok) = v;
+            res = self.state.compare_exchange(Tracked(&mut perm), UNLOCKED, LOCKED);
+            proof {
+                if res is Ok {
+                    out = tok;
+                    v = (perm, None);
+                } else {
+                    v = (perm, tok);
+                }
+            }
+        });
+        (res.is_ok(), Tracked(out))
+    }
+
+    /// A load of the word.
+    #[inline(always)]
+    fn load(&self) -> u32 {
+        proof {
+            use_type_invariant(self);
+        }
+        let r;
+        vstd::open_atomic_invariant!(self.inv.borrow() => v => {
+            let tracked (perm, tok) = v;
+            r = self.state.load(Tracked(&perm));
+            proof {
+                v = (perm, tok);
+            }
+        });
+        r
+    }
+
+    /// `swap(CONTENDED)`: the slow path's acquire, which acquires when it
+    /// returns `UNLOCKED`, and then hands out the lock's token.
+    #[inline(always)]
+    fn swap_contended(&self) -> (r: (u32, Tracked<Option<Unlocked>>))
+        ensures
+            (r.0 == UNLOCKED) == r.1@ is Some,
+            r.1@ matches Some(t) ==> self.is_token(t),
+    {
+        proof {
+            use_type_invariant(self);
+        }
+        let c;
+        let tracked mut out: Option<Unlocked> = None;
+        vstd::open_atomic_invariant!(self.inv.borrow() => v => {
+            let tracked (mut perm, tok) = v;
+            c = self.state.swap(Tracked(&mut perm), CONTENDED);
+            proof {
+                out = tok;
+                v = (perm, None);
+            }
+        });
+        (c, Tracked(out))
     }
 
     /// Acquire without blocking. `true` on success.
     #[inline]
     #[cfg(test)]
-    pub fn try_lock(&self) -> bool {
+    pub fn try_lock(&self) -> (r: (bool, Tracked<Option<Unlocked>>))
+        ensures
+            r.0 == r.1@ is Some,
+            r.1@ matches Some(t) ==> self.is_token(t),
+    {
         self.try_acquire()
     }
 
-    /// Acquire, blocking as needed. Opens any invariant (stated, though it
+    /// Acquire, blocking as needed, and return the lock's token
+    /// ([`Unlocked`]). Opens any invariant (stated, though it
     /// is Verus's default): a function that declares a narrower mask
     /// cannot call it. Verified callers outside this module cannot meet
     /// the `lock_rs_only` requirement (its body is closed): they acquire
     /// through [`Lock::lock`] or [`RawLock::lock_held`], which check the
     /// lock order.
     #[inline]
-    pub fn lock(&self)
+    pub fn lock(&self) -> (t: Tracked<Unlocked>)
         requires
             crate::sys::may_syscall(),
             lock_rs_only(),
+        ensures
+            self.is_token(t@),
         opens_invariants any
     {
-        if !self.try_acquire() {
-            self.lock_slow();
+        let (ok, Tracked(t)) = self.try_acquire();
+        if !ok {
+            return self.lock_slow();
         }
+        Tracked(t.tracked_unwrap())
     }
 
     /// Termination is not claimed: the wait ends when another thread
     /// releases the lock.
     #[cold]
     #[verifier::exec_allows_no_decreases_clause]
-    fn lock_slow(&self)
+    fn lock_slow(&self) -> (t: Tracked<Unlocked>)
         requires
             crate::sys::may_syscall(),
+        ensures
+            self.is_token(t@),
     {
         // The forking thread inside the fork window already holds it
         // ([`fork_holder_is_me`]): served as acquired, released as a no-op.
         if fork_holder_is_me() {
-            return;
+            return Tracked(axiom_window_served(*self));
         }
         for _ in 0..SPINS {
-            if self.state.load(Ordering::Relaxed) == UNLOCKED && self.try_acquire() {
-                return;
+            if self.load() == UNLOCKED {
+                let (ok, Tracked(t)) = self.try_acquire();
+                if ok {
+                    return Tracked(t.tracked_unwrap());
+                }
             }
             core::hint::spin_loop();
         }
         // Announce a possible waiter, then sleep while the word stays
         // CONTENDED. A spurious wake or `EINTR` just loops: `swap` re-checks.
-        let mut c = self.state.swap(CONTENDED, Ordering::Acquire);
+        let (mut c, Tracked(t)) = self.swap_contended();
+        let tracked mut tok = t;
         while c != UNLOCKED
             invariant
                 crate::sys::may_syscall(),
+                (c == UNLOCKED) == tok is Some,
+                tok matches Some(t) ==> self.is_token(t),
         {
             wait(&self.state, CONTENDED);
-            c = self.state.swap(CONTENDED, Ordering::Acquire);
+            let (c2, Tracked(t2)) = self.swap_contended();
+            c = c2;
+            proof {
+                tok = t2;
+            }
         }
+        Tracked(tok.tracked_unwrap())
     }
 
-    /// Release. Must be called by the holder exactly once per acquire.
+    /// Release, handing the lock's token `t` back to the word's invariant.
+    /// Must be called by the holder exactly once per acquire.
     /// Private: every release outside this file goes through
     /// [`RawLock::unlock_held`], which takes the hold's token back, or a
-    /// guard's drop. A public release without a token would let a caller
-    /// release and re-take the lock, holding two [`LockHeld`] tokens for
-    /// one lock and, through [`Lock::lock_held_perm`], two permissions of
-    /// its cell.
+    /// guard's drop. A public release would let a caller release and
+    /// re-take the lock with the token of a [`LockHeld`] it keeps,
+    /// holding two [`LockHeld`] tokens for one lock and, through
+    /// [`Lock::lock_held_perm`], two permissions of its cell.
     #[inline]
-    fn release(&self)
+    fn release(&self, Tracked(t): Tracked<Unlocked>)
         requires
             crate::sys::may_syscall(),
+            self.is_token(t),
     {
         // An acquire the fork window served ([`RawLock::lock_slow`]): the
-        // lock stays with the fork handlers.
+        // lock stays with the fork handlers, and the token goes.
         if fork_holder_is_me() {
             return;
         }
-        if self.state.swap(UNLOCKED, Ordering::Release) == CONTENDED {
+        proof {
+            use_type_invariant(self);
+        }
+        let prev;
+        vstd::open_atomic_invariant!(self.inv.borrow() => v => {
+            let tracked (mut perm, _held) = v;
+            prev = self.state.swap(Tracked(&mut perm), UNLOCKED);
+            proof {
+                v = (perm, Some(t));
+            }
+        });
+        if prev == CONTENDED {
             wake(&self.state);
         }
+    }
+
+    /// [`RawLock::release`] of a guard's token, which the guard keeps in
+    /// `t` (`LockGuard::drop`, which cannot take it out of the guard
+    /// itself: it is trusted, and runs no proof code).
+    #[inline(always)]
+    #[allow(unused_variables)]
+    fn release_guard(&self, t: &mut Tracked<Option<Unlocked>>)
+        requires
+            crate::sys::may_syscall(),
+            old(t)@ matches Some(x) && self.is_token(x),
+    {
+        let tracked tok = t.borrow_mut().tracked_take();
+        self.release(Tracked(tok));
     }
 
     /// [`RawLock::lock`], returning the hold as a [`LockHeld`] token, for
@@ -190,12 +394,12 @@ impl RawLock {
             final(ord).top() == self.rank(),
             final(ord).ranks() == old(ord).ranks().insert(self.rank()),
     {
-        self.lock();
+        let Tracked(tok) = self.lock();
         proof {
             ord.top = self.rank();
             ord.ranks = ord.ranks.insert(self.rank());
         }
-        Tracked(LockHeld { lock: *self })
+        Tracked(LockHeld { lock: *self, tok })
     }
 
     /// [`RawLock::release`] by the holder, which hands its token back,
@@ -216,18 +420,38 @@ impl RawLock {
         proof {
             ord.ranks = ord.ranks.remove(self.rank());
         }
-        self.release();
+        self.release(Tracked(t.into_token()));
     }
 
     /// Whether some thread currently holds the lock. Diagnostic only.
     #[inline]
     #[cfg(test)]
     pub fn is_locked(&self) -> bool {
-        self.state.load(Ordering::Relaxed) != UNLOCKED
+        self.load() != UNLOCKED
     }
 }
 
-/// Ghost: its owner holds the raw lock [`LockHeld::held`].
+/// Premise (the fork window, design 9): an acquisition of `l` that the
+/// fork window served ([`RawLock::lock_slow`] on the path where
+/// [`fork_holder_is_me`] returned true) holds `l`'s token. The prepare
+/// handler took every allocator lock before it opened the window
+/// ([`fork_prepared`]), so its [`LockHeld`] has the real token, and the
+/// one this premise gives is a second one for the same hold: it stands for
+/// that hold, used by the one thread that runs allocator code there until
+/// the release, which, in the window, does not touch the word
+/// ([`RawLock::release`] drops the token). Every lock the window serves is
+/// one the prepare handler took: no arena (and so no lock) is built there
+/// (`Arenas::create`, `Arenas::materialise`).
+///
+/// Checked by `lock::tests::permission_axioms_are_called_only_at_acquisitions`.
+axiom fn axiom_window_served(l: RawLock) -> (tracked t: Unlocked)
+    ensures
+        l.is_token(t),
+;
+
+/// Ghost: its owner holds the raw lock [`LockHeld::held`], and has its
+/// token ([`Unlocked`]), which the word's invariant gave up when the
+/// acquisition moved the word off `UNLOCKED`.
 /// [`RawLock::lock_held`] makes one after its `lock` returns, and
 /// [`RawLock::unlock_held`] takes it back as it unlocks. The field is
 /// private to this module, so outside it only `lock_held` and
@@ -236,21 +460,37 @@ impl RawLock {
 /// assume theirs. The token is not `Copy`, so each token is handed back
 /// at most once. A token names its lock by value (Verus has no addresses of
 /// references): a proof matches it to the accessor path it was taken
-/// through, not to an address. That `lock` returns only once this thread
-/// holds the lock, and that no other thread does until `unlock`, is the
-/// futex mutex's contract, which Verus does not check (the atomics
-/// return any value): the token records the calls; the mutex makes them
-/// a hold.
+/// through, not to an address. That the token's lock is held by this
+/// thread alone follows from the word's invariant: the token is in the
+/// invariant exactly while the word is `UNLOCKED`, so outside the fork
+/// window ([`axiom_window_served`]) only the acquisition that moved the
+/// word off `UNLOCKED` took it.
 // Ghost: built and read only by proof code.
 #[allow(dead_code)]
 pub tracked struct LockHeld {
     ghost lock: RawLock,
+    tracked tok: Unlocked,
 }
 
 impl LockHeld {
+    /// The token is the lock's.
+    #[verifier::type_invariant]
+    closed spec fn wf(self) -> bool {
+        self.lock.is_token(self.tok)
+    }
+
     /// The lock this token holds.
     pub closed spec fn held(self) -> RawLock {
         self.lock
+    }
+
+    /// The lock's token, for its release.
+    proof fn into_token(tracked self) -> (tracked t: Unlocked)
+        ensures
+            self.held().is_token(t),
+    {
+        use_type_invariant(&self);
+        self.tok
     }
 }
 
@@ -671,25 +911,29 @@ pub(crate) fn fork_window_close()
     FORK_HOLDER.store(0, Ordering::Relaxed);
 }
 
-// The futex calls; neither returns anything the callers use.
+// The futex calls; neither returns anything the callers use. The futex
+// word is the `u32` of the `PAtomicU32`, at its address: vstd's
+// `PAtomicU32` is one `AtomicU32` field, and the assertion after this
+// block checks it is a `u32`'s size and alignment, so the field is at
+// offset 0.
 
 #[inline]
-fn wait(state: &AtomicU32, val: u32)
+fn wait(state: &PAtomicU32, val: u32)
     requires
         crate::sys::may_syscall(),
 {
     // SAFETY: `state` is a live, aligned `u32` for the duration of the call.
     // Every error (EAGAIN: already changed; EINTR: signal) means "re-check".
-    let _ = unsafe { crate::sys::futex_wait(state.as_ptr(), val, None) };
+    let _ = unsafe { crate::sys::futex_wait(core::ptr::from_ref(state) as *const u32, val, None) };
 }
 
 #[inline]
-fn wake(state: &AtomicU32)
+fn wake(state: &PAtomicU32)
     requires
         crate::sys::may_syscall(),
 {
     // SAFETY: `state` is a live, aligned `u32`.
-    let _ = unsafe { crate::sys::futex_wake(state.as_ptr(), 1) };
+    let _ = unsafe { crate::sys::futex_wake(core::ptr::from_ref(state) as *const u32, 1) };
 }
 
 /// A [`RawLock`] guarding a value.
@@ -855,6 +1099,11 @@ impl<T> DerefMut for Padded<T> {
 
 const _: () = assert!(core::mem::align_of::<Padded<u8>>() == PAD_ALIGN);
 
+// The futex word is the `PAtomicU32` itself (`wait`, `wake`): a `u32`'s
+// size and alignment, so its one field is at offset 0.
+const _: () =
+    assert!(core::mem::size_of::<PAtomicU32>() == 4 && core::mem::align_of::<PAtomicU32>() == 4);
+
 verus! {
 
 // SAFETY: access to `value` is serialised by `raw`, so sharing the lock
@@ -930,9 +1179,9 @@ impl<T> Lock<T> {
             !final(under).root(),
         opens_invariants any
     {
-        self.raw.lock();
+        let Tracked(tok) = self.raw.lock();
         let tracked perm = axiom_acquired(*self);
-        let g = LockGuard { lock: self, perm: Tracked(perm) };
+        let g = LockGuard { lock: self, perm: Tracked(perm), tok: Tracked(Some(tok)) };
         proof {
             *under = LockOrder { top: self.rank(), root: false, ranks: Set::empty(), life: PhantomData };
         }
@@ -954,9 +1203,10 @@ impl<T> Lock<T> {
         ensures
             r matches Some(g) ==> lock_inv(g@) && lock_frame(lock_init(*self), g@) && g.spec_lock() == *self,
     {
-        if self.raw.try_lock() {
+        let (ok, t) = self.raw.try_lock();
+        if ok {
             let tracked perm = axiom_acquired(*self);
-            Some(LockGuard { lock: self, perm: Tracked(perm) })
+            Some(LockGuard { lock: self, perm: Tracked(perm), tok: t })
         } else {
             None
         }
@@ -1015,12 +1265,12 @@ impl<T> Lock<T> {
             final(ord).ranks() == old(ord).ranks().insert(self.rank()),
             self.rank() == rank_state() ==> fork_prepared(*final(ord)),
     {
-        self.raw.lock();
+        let Tracked(tok) = self.raw.lock();
         proof {
             ord.top = self.rank();
             ord.ranks = ord.ranks.insert(self.rank());
         }
-        Tracked((LockHeld { lock: self.raw }, axiom_acquired(*self)))
+        Tracked((LockHeld { lock: self.raw, tok }, axiom_acquired(*self)))
     }
 
     /// The value, read through the permission `perm` of the cell, which a
@@ -1082,7 +1332,7 @@ impl<T> Lock<T> {
         proof {
             ord.ranks = ord.ranks.remove(t.held().rank());
         }
-        self.raw.release();
+        self.raw.release(Tracked(t.into_token()));
     }
 }
 
@@ -1095,13 +1345,18 @@ pub struct LockGuard<'a, T> {
     /// Ghost: the permission of the lock's cell.
     #[allow(dead_code)]
     perm: Tracked<PointsTo<T>>,
+    /// Ghost: the lock's token ([`Unlocked`]), which the drop's release
+    /// hands back to the word's invariant.
+    #[allow(dead_code)]
+    tok: Tracked<Option<Unlocked>>,
 }
 
 impl<'a, T> LockGuard<'a, T> {
-    /// The permission is the cell's.
+    /// The permission is the cell's, and the token the lock's.
     #[verifier::type_invariant]
     closed spec fn wf(&self) -> bool {
-        self.perm@.id() == self.lock.value.id()
+        &&& self.perm@.id() == self.lock.value.id()
+        &&& self.tok@ matches Some(t) && self.lock.raw.is_token(t)
     }
 
     /// The lock this guard holds.
@@ -1219,8 +1474,10 @@ fn cell_mut<'b, T>(c: &'b PCell<T>, t: &'b mut Tracked<PointsTo<T>>) -> (r: &'b 
 }
 
 // Trusted: Verus wants a destructor that opens no invariant and cannot
-// unwind, and `RawLock::release` is not marked either way. The body is the
-// release, and claims nothing; its `no_unwind` rests on the
+// unwind, and `RawLock::release` opens the word's invariant and is not
+// marked `no_unwind`. The body is the release of the guard's token
+// (`RawLock::release_guard`, whose requirement the guard's type invariant
+// gives), and claims nothing; its `no_unwind` rests on the
 // `panic = "abort"` profiles (test builds unwind).
 impl<T> Drop for LockGuard<'_, T> {
     #[inline]
@@ -1229,7 +1486,7 @@ impl<T> Drop for LockGuard<'_, T> {
         opens_invariants none
         no_unwind
     {
-        self.lock.raw.release();
+        self.lock.raw.release_guard(&mut self.tok);
     }
 }
 

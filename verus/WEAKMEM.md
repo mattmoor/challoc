@@ -102,10 +102,13 @@ a compiler barrier.
 ### P2. `Lock`
 
 - `RawLock` (`lock.rs`) is a futex mutex over one `u32` (Drepper's
-  "mutex, take 3"): `try_acquire`'s `compare_exchange(0, 1, Acquire,
-  Relaxed)`; in `lock_slow`, a `Relaxed` spin of up to `SPINS` (100)
-  rounds, then `swap(2, Acquire)` and `FUTEX_WAIT`; `release`'s
-  `swap(0, Release)`, and `FUTEX_WAKE` when the old value was 2.
+  "mutex, take 3"), a vstd `PAtomicU32` since #856 step 1, so every
+  operation is `SeqCst`: `try_acquire`'s `compare_exchange(0, 1)`; in
+  `lock_slow`, a spin of up to `SPINS` (100) rounds of a load, then
+  `swap(2)` and `FUTEX_WAIT`; `release`'s `swap(0)`, and `FUTEX_WAKE`
+  when the old value was 2. (Before, they were the `Acquire` CAS, a
+  `Relaxed` spin, an `Acquire` `swap(2)` and a `Release` `swap(0)`,
+  the orderings the weakening table below names.)
 - Every lock value (class `Inner`, the commit lock's `TableInner`,
   sets, `meta::Inner`, `huge::Inner`, the arena registry, statistics,
   `Tcaches`, the background `STATE`) is plain data under the lock, with

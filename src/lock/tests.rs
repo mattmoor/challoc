@@ -192,17 +192,23 @@ fn lock_axioms_state_assumed_specs() {
 /// called only where `Lock::lock` and `Lock::try_lock` build their
 /// guard and where `Lock::lock_held_perm` hands the permission to its
 /// holder, each right after an acquire. It is private to `lock.rs`.
+/// `axiom_window_served` mints a second token of a lock the fork window
+/// holds: it is called once, in `RawLock::lock_slow`, on the line right
+/// after the `fork_holder_is_me` test that opens the window's path.
 #[test]
 fn permission_axioms_are_called_only_at_acquisitions() {
     // Spelled in parts, so that this test's own lines match nothing.
     // A call is the name then `(` or a turbofish `::`.
     let acquired = std::format!("{}{}", "axiom_", "acquired");
+    let served = std::format!("{}{}", "axiom_", "window_served");
     let calls = |t: &str, name: &str| {
         t.contains(std::format!("{name}(").as_str())
             || t.contains(std::format!("{name}::").as_str())
     };
     let mut a = Vec::new();
+    let mut w = Vec::new();
     let mut func = "";
+    let mut prev = "";
     for line in include_str!("../lock.rs").lines() {
         let t = line.trim();
         if t.starts_with("//") {
@@ -214,8 +220,13 @@ fn permission_axioms_are_called_only_at_acquisitions() {
         if calls(t, &acquired) && !t.starts_with("axiom fn") {
             a.push(func);
         }
+        if calls(t, &served) && !t.starts_with("axiom fn") {
+            w.push((func, prev));
+        }
+        prev = t;
     }
     assert_eq!(a, ["lock", "try_lock", "lock_held_perm"]);
+    assert_eq!(w, [("lock_slow", "if fork_holder_is_me() {")]);
 }
 
 /// `in_child_fork_window` passes `axiom_child_window` the window's
@@ -459,15 +470,16 @@ fn root_lock_order_uses_are_listed() {
 fn raw_lock_state_machine() {
     let l = RawLock::new(Ghost::assume_new());
     assert!(!l.is_locked());
-    assert!(l.try_lock());
+    let (ok, mut t) = l.try_lock();
+    assert!(ok);
     assert!(l.is_locked());
-    assert!(!l.try_lock());
-    l.release();
+    assert!(!l.try_lock().0);
+    l.release_guard(&mut t);
     assert!(!l.is_locked());
-    assert_eq!(l.state.load(Ordering::Relaxed), UNLOCKED);
-    l.lock();
-    assert!(!l.try_lock());
-    l.release();
+    assert_eq!(l.load(), UNLOCKED);
+    let t = l.lock();
+    assert!(!l.try_lock().0);
+    l.release(t);
     assert!(!l.is_locked());
 }
 
@@ -502,7 +514,7 @@ fn contended_counter_is_exact() {
         }
     });
     assert_eq!(*l.lock_t(), THREADS * ITERS);
-    assert_eq!(l.raw().state.load(Ordering::Relaxed), UNLOCKED);
+    assert_eq!(l.raw().load(), UNLOCKED);
 }
 
 /// Long holds force the futex path (spinning cannot outlast them) and
@@ -530,7 +542,7 @@ fn sleepers_are_woken() {
             assert_eq!(mine, (0..20).map(|i| t * 100 + i).collect::<Vec<_>>());
         }
     }
-    assert_eq!(l.raw().state.load(Ordering::Relaxed), UNLOCKED);
+    assert_eq!(l.raw().load(), UNLOCKED);
 }
 
 /// One waiter spinning while the holder sleeps past the spin phase:
@@ -566,29 +578,29 @@ fn a_parked_waiter_is_released() {
         }
     }
     let l = Arc::new(RawLock::new(Ghost::assume_new()));
-    l.lock();
+    let t = l.lock();
     let waiter = {
         let l = Arc::clone(&l);
         std::thread::spawn(move || {
-            l.lock();
+            let t = l.lock();
             let acquired_at = Instant::now();
-            l.release();
+            l.release(t);
             acquired_at
         })
     };
     // The announce: the spin phase ends with the swap to `CONTENDED`.
-    if !within_bound(|| l.state.load(Ordering::Relaxed) == CONTENDED) {
-        l.release();
+    if !within_bound(|| l.load() == CONTENDED) {
+        l.release(t);
         panic!("the waiter did not announce itself within {BOUND:?}");
     }
     // Parked: while the lock stays held the word stays `CONTENDED`
     // and the waiter does not get through. Read, then release, then
     // assert, so a failure leaves nothing parked.
     std::thread::sleep(Duration::from_millis(20));
-    let word = l.state.load(Ordering::Relaxed);
+    let word = l.load();
     let through = waiter.is_finished();
     let released_at = Instant::now();
-    l.release();
+    l.release(t);
     assert_eq!(word, CONTENDED, "the word changed while the lock was held");
     assert!(!through, "the waiter got through while the lock was held");
     // Released: the wake reaches the waiter. On failure the waiter
@@ -603,7 +615,7 @@ fn a_parked_waiter_is_released() {
         "acquired {:?} before the release",
         released_at - acquired_at
     );
-    assert_eq!(l.state.load(Ordering::Relaxed), UNLOCKED);
+    assert_eq!(l.load(), UNLOCKED);
 }
 
 /// Weak-memory stress of `RawLock` (ignored; `CHALLOC_STRESS_SECS`).
@@ -611,8 +623,8 @@ fn a_parked_waiter_is_released() {
 /// equal and bump them all. A holder that reads two different words,
 /// or a final value below the acquisitions, saw a critical section
 /// whose writes were not ordered before its own: the edge from
-/// `release`'s `swap(Release)` to the next `try_acquire` or
-/// `swap(CONTENDED, Acquire)` (WEAKMEM.md, P2). Twice the CPUs keep
+/// `release`'s swap to `UNLOCKED` to the next `try_acquire` or swap to
+/// `CONTENDED`, all `SeqCst` (vstd's `PAtomicU32`; WEAKMEM.md, P2). Twice the CPUs keep
 /// some lockers on the futex path.
 #[test]
 #[ignore]
@@ -665,5 +677,5 @@ fn stress_lock_edges() {
     );
     assert_eq!(torn.load(Ordering::Relaxed), 0, "a holder read torn words");
     assert_eq!(end, [total; 4], "lost updates: {lost}");
-    assert_eq!(l.raw().state.load(Ordering::Relaxed), UNLOCKED);
+    assert_eq!(l.raw().load(), UNLOCKED);
 }
