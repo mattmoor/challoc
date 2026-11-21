@@ -1119,7 +1119,8 @@ pub open spec fn cell_ns() -> int {
 /// and the owner states them by an axiom that names the holders. A frame
 /// of `true` may be defined either way: no release can break it.
 /// [`Lock::new`] requires the frame of the initial value with itself,
-/// which [`axiom_acquired`] claims at the first acquisition. The two method
+/// which the cell's invariant ([`CellPred`]) holds until the first
+/// acquisition. The two method
 /// names are defined nowhere else in the crate (several locked types have
 /// an inherent `inv`), so
 /// `lock::tests::lock_axioms_state_assumed_specs` finds every use of
@@ -1148,7 +1149,9 @@ pub trait LockSpec: Sized {
 /// permission again. The owner of each locked type states what it means
 /// for that type ([`LockSpec`]), and, where an axiom states it, lists its
 /// unverified holders and the verified ones that rest on a premise. The
-/// assumption enters at [`axiom_acquired`].
+/// assumption enters at a dropped guard's release (`LockGuard::drop`,
+/// trusted, calls [`Lock::release_cell`], which requires it, without the
+/// check), and in the fork window at [`axiom_window_cell`].
 pub open spec fn lock_inv<T: LockSpec>(v: T) -> bool {
     <T as LockSpec>::lock_spec_inv(v)
 }
@@ -1450,8 +1453,8 @@ impl<T> Lock<T> {
 
     /// [`RawLock::lock_held`] for a holder that also keeps the value:
     /// acquire, and return the hold's token with the permission of the
-    /// cell, taken out of the free lock's invariant as [`Lock::lock`]
-    /// takes it for its guard ([`axiom_acquired`]). The holder reads the
+    /// cell, taken out of the cell's invariant as [`Lock::lock`]
+    /// takes it for its guard ([`Lock::acquired`]). The holder reads the
     /// value through it ([`Lock::value_held`]) and writes it through it
     /// ([`Lock::value_held_mut`]), and nothing else can touch the value while it
     /// keeps it: the fork handlers keep the creation lock's
@@ -1534,8 +1537,8 @@ impl<T> Lock<T> {
     /// which the free lock's invariant holds again, once the fork window
     /// has closed ([`window_closed`]). Like [`LockGuard::unlock`], it
     /// requires the value it hands back to keep [`lock_inv`] and
-    /// [`lock_frame`], so the next acquisition's claim of them
-    /// ([`axiom_acquired`]) is checked here.
+    /// [`lock_frame`], which the cell's invariant holds for the next
+    /// acquisition ([`Lock::release_cell`]).
     #[inline(always)]
     pub(crate) fn unlock_held_perm(&self, Tracked(t): Tracked<LockHeld>, Tracked(perm): Tracked<PointsTo<T>>, Tracked(ord): Tracked<&mut LockOrder>)
         where T: LockSpec
@@ -1561,7 +1564,8 @@ impl<T> Lock<T> {
 
 /// Exclusive access to a [`Lock`]'s value; unlocks on drop. Holds the
 /// permission of the lock's cell, taken at the acquisition
-/// ([`axiom_acquired`]), until the drop releases the lock.
+/// ([`Lock::acquired`]), and the lock's token, until the drop releases
+/// the lock ([`Lock::release_cell`]).
 #[verifier::reject_recursive_types(T)]
 pub struct LockGuard<'a, T: LockSpec> {
     lock: &'a Lock<T>,
@@ -1606,9 +1610,9 @@ impl<'a, T: LockSpec> LockGuard<'a, T> {
 
     /// Release the lock, handing the value back with the lock's invariant
     /// and frame restored ([`lock_inv`], [`lock_frame`]): the explicit
-    /// unlock a verified holder ends with, which checks what the free
-    /// lock's invariant takes back at the next [`axiom_acquired`]. The
-    /// release is the guard's drop, at the end of the body.
+    /// unlock a verified holder ends with, which checks what the cell's
+    /// invariant takes back for the next acquisition. The release is the
+    /// guard's drop, at the end of the body ([`Lock::release_cell`]).
     #[inline(always)]
     pub fn unlock(self)
         where T: LockSpec

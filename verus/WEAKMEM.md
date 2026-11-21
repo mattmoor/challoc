@@ -774,7 +774,6 @@ another thread's exchange as often as other threads retake the lock.
 | `api/mod.rs.md` | `init_slow` | partly checked (loom, GenMC copy) |
 | `class/table.rs.md` | `store_owner` | partly checked (loom, GenMC copy) |
 | `lock.rs.md` | `RawLock::lock_slow` | trusted |
-| `lock.rs.md` | `axiom_acquired` | partly checked (loom) |
 | `lock.rs.md` | `LockGuard::drop` | partly checked (loom) |
 | `purge/background.rs.md` | `main` | partly checked (loom, GenMC copy) |
 | `vspec/atom.rs.md` | `store_usize` | partly checked (Kani, loom, GenMC) |
@@ -798,13 +797,15 @@ The arguments, by group (the overrides comments give each in full):
 - `background::main` (exit models): it returns after a final
   `request(false)`, given each pass returns and the exit takes the state
   lock.
-- `LockGuard::drop` (P2 models): its body is `RawLock::release`.
-- `axiom_acquired` (P2 models): the permission passes from holder to
-  holder across `RawLock`'s mutual exclusion and its acquire/release
-  edge, which the models check; the permission itself is Verus's model,
-  its invariant and frame rest on the holders' releases, and at the first
-  acquisition the initial value's frame is checked by nothing and its
-  visibility rests on the lock's publication.
+- `LockGuard::drop` (P2 models): its body is `Lock::release_cell`, whose
+  word step is `RawLock::release`'s.
+- The cell's hand-off is no longer a seam (#856, `axiom_acquired` is
+  gone): the permission passes from holder to holder through the lock's
+  cell invariant (`lock::CellPred`) and the word's (`lock::RawPred`),
+  over vstd's `SeqCst` `PAtomicU32`, under vstd's sequentially
+  consistent model; the P2 models check the same edge on a copy of
+  `RawLock`. The initial value's visibility still rests on the lock's
+  publication.
 - The bitmap word wrappers (`vspec/word.rs`) are not in the table:
   they are verified over vstd's `PAtomicU64`, whose `SeqCst` operations
   vstd specifies under its sequentially consistent model. The P1, P5

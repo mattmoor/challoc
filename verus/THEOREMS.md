@@ -546,14 +546,18 @@ trusted only in how it is reached:
 - `sys::pac::axiom_user_va_limit` (`sys/pac.rs`): the limit is at
   most `2^48`.
 
-**Locks.** `lock::axiom_acquired`: an acquisition takes the permission
-of the lock's cell (a vstd `PCell`) out of the free lock's invariant,
-and the value satisfies `lock_inv` and `lock_frame`, for a guard or for
+**Locks.** `lock::axiom_window_cell` (the fork window's served
+acquisition; outside the window the hand-off is verified, theorem 13's
+mutex premise): an acquisition takes the permission
+of the lock's cell (a vstd `PCell`) out of the lock's cell invariant
+(`lock::CellPred`), and the value satisfies `lock_inv` and `lock_frame`,
+for a guard or for
 a holder with no guard (`Lock::lock_held_perm`). The guard's `deref` and
 `deref_mut` are verified, and so are the two helpers they call
 (`cell_ref`, `cell_mut`), which pass the guard's permission to vstd's
-`PCell::borrow` and `borrow_mut`; `drop` (`lock.rs`) is `external_body` and checks
-nothing. `LockGuard::unlock` (`lock.rs`, verified, empty body: the
+`PCell::borrow` and `borrow_mut`; `drop` (`lock.rs`) is `external_body`:
+it calls the verified `Lock::release_cell`, which puts the permission
+back, without checking its `lock_inv` and `lock_frame` requirement. `LockGuard::unlock` (`lock.rs`, verified, empty body: the
 release is the guard's drop at its end) requires `lock_inv` and
 `lock_frame` of the value. Every holder of the metadata lock outside the tests ends with it, on every path to a
 return (`Meta::alloc`, `alloc_raw`, `alloc_zeroed`, `free`, `reserve`,
@@ -579,7 +583,7 @@ frame are not checked at the release: each verified holder ends with them
 through its last call's postcondition or an `assert`. Ten locks'
 holders all end with it. For all ten no axiom states `lock_inv` and
 `lock_frame`: each type's `LockSpec` impl defines them, and what is
-left is the mutex contract (`lock::axiom_acquired`) and that every
+left is the fork window's premise (`lock::axiom_window_cell`) and that every
 holder outside the tests reaches `LockGuard::unlock`, which the source
 test `api::tests::guards_end_in_unlock` checks. The arena creation lock
 and the state lock are also held by the fork handlers, whose release,
@@ -2858,7 +2862,19 @@ build a token; the handoff axioms below are the other source.
   `lock::axiom_window_served`, which gives the acquisition the window
   serves a second token standing for the prepare handler's hold (called
   once, on that path; `lock::tests::permission_axioms_are_called_only_at_acquisitions`).
-  The cell's permission is still `lock::axiom_acquired`'s.
+  The cell's side is checked too (#856 step 2): a `Lock`'s cell
+  invariant (`lock::CellPred`) holds the cell's permission, with
+  `lock_inv` and `lock_frame`, and the other half of the token
+  (`GhostVarAuth`), at `false` exactly while the permission is in. An
+  acquisition agrees its token (from the word, at `false`) with that
+  half, takes the permission and sets both to `true`; the release puts
+  it back and sets both to `false` (`Lock::acquired`, `Lock::returned`).
+  So outside the fork window a holder's permission is the one the
+  invariant gave up. In the window, `lock::axiom_window_cell` gives a
+  `Lock`'s served acquisition its token and permission (in place of
+  the retired `axiom_acquired`). A bare hold keeps its token at `false`
+  (`LockHeld::raw`, which `RawLock::unlock_held` requires and
+  `ForkHeld::bare` carries for every fork hold but the creation lock's).
 - *The handoff* (`axiom_fork_resumed_state`, `api/mod.rs`, and
   `axiom_fork_resumed`; axioms). Ghost state does not cross the
   C calls, so the hold `fork_prepare` ends with is restated where the
@@ -2950,7 +2966,7 @@ build a token; the handoff axioms below are the other source.
   `lock::axiom_c_entry`, minted only in export bodies, which
   `api::tests::c_call_tokens_only_in_export_bodies` checks; and the init,
   thread and fork roots). No such read runs in the fork window: the guards the window
-  serves stand for the hold (`lock::axiom_acquired`), and that they
+  serves stand for the hold (`lock::axiom_window_cell`), and that they
   leave the count and the table as read is `axiom_fork_resumed`'s
   premise.
 - The state lock's rank is proved (`STATE`'s postcondition, which
