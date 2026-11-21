@@ -125,6 +125,8 @@ use abort::{
 pub use sets::SET_GROUPS;
 pub(crate) use sets::Set;
 pub use sets::SetTable;
+#[cfg(verus_keep_ghost)]
+pub use table::BitLoad;
 pub use table::CommittedInv;
 pub use table::SlabTable;
 #[cfg(verus_keep_ghost)]
