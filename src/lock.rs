@@ -1321,8 +1321,8 @@ impl<T> Lock<T> {
     /// invariant, with its value's [`lock_inv`] and [`lock_frame`], and
     /// the token `t` (the hold's) back at `false`, for the word
     /// ([`RawLock::release_word`]). The token is at `true` (a holder of
-    /// the permission's), or the invariant would hold a second
-    /// permission of the cell.
+    /// the permission's): at `false` the invariant would hold a second
+    /// permission of the cell, which this one would replace.
     proof fn returned(tracked &self, tracked t: Unlocked, tracked perm: PointsTo<T>, tracked credit: OpenInvariantCredit) -> (tracked r: Unlocked)
         where T: LockSpec
         requires
@@ -1339,11 +1339,10 @@ impl<T> Lock<T> {
         let tracked mut perm = perm;
         vstd::open_atomic_invariant_in_proof!(credit => self.cell.borrow() => v => {
             let tracked (mut auth, p) = v;
-            auth.agree(&tok);
-            if p is Some {
-                // A second permission of the cell: impossible.
-                perm.is_exclusive(p.tracked_borrow());
-            }
+            // `p` is `None`: a second permission of the cell would prove
+            // `false` (vstd's `PointsTo::is_exclusive`); the proof does
+            // not need it, since the invariant takes `perm` either way.
+            let tracked _p = p;
             auth.update(&mut tok, false);
             v = (auth, Some(perm));
         });

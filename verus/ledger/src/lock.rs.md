@@ -177,7 +177,7 @@ pub(crate) fn value_ptr(p: *mut Lock<T>, Tracked(perm): Tracked<&vstd::raw_ptr::
 
 ## `LockGuard::drop`
 
-src/lock.rs:1719. Kind: external_body. Category: atomics primitive.
+src/lock.rs:1718. Kind: external_body. Category: atomics primitive.
 Tool: loom/GenMC. Status: trusted (partly checked, loom: lock::loom_lock_two_threads and lock::loom_lock_three_threads; not checked: this body, which the models replace with a copy of `RawLock::release`, with two lockers and with three bounded at 5 preemptions; its unchecked `lock_inv` and `lock_frame` requirement for a guard that drops without `LockGuard::unlock`; the kernel's futex, which the models replace with a stand-in that also orders the waker's accesses before the woken thread's return).
 
 Hashes: contract 3065263068, body 3567698186.
