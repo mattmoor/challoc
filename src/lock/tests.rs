@@ -26,7 +26,7 @@ impl<T> LockSpec for Vec<T> {}
 /// spelled with a space before `(`, a `use .. as` rename, a trusted
 /// fact outside an `axiom fn` (an `external_body` proof, an `assume`),
 /// and a type named only inside `ensures`. `lock.rs`, whose axiom
-/// `axiom_acquired` is generic over `T`, is not scanned. What the scan
+/// `axiom_window_cell` is generic over `T`, is not scanned. What the scan
 /// reads each impl to define is what `DEFINED` lists, so a lock whose
 /// axioms were retired is one the scan sees, and a leftover axiom on it
 /// fails here.
@@ -187,19 +187,20 @@ fn lock_axioms_state_assumed_specs() {
     }
 }
 
-/// `axiom_acquired` mints a permission of a lock's cell, and two alive
-/// at once would prove `false` (vstd's `PointsTo::is_exclusive`): it is
-/// called only where `Lock::lock` and `Lock::try_lock` build their
-/// guard and where `Lock::lock_held_perm` hands the permission to its
-/// holder, each right after an acquire. It is private to `lock.rs`.
-/// `axiom_window_served` mints a second token of a lock the fork window
-/// holds: it is called once, in `RawLock::lock_slow`, on the line right
-/// after the `fork_holder_is_me` test that opens the window's path.
+/// The fork window's two premises mint what the window's hold already
+/// has: `axiom_window_served` a second token of a bare raw lock, and
+/// `axiom_window_cell` a second token and permission of a `Lock`'s cell
+/// (two permissions alive at once prove `false`, vstd's
+/// `PointsTo::is_exclusive`). Each is called once, on the `else` branch of
+/// `t is Some` for the token `RawLock::acquire` returned, which is `None`
+/// only on the window's path (`RawLock::lock_slow`): `axiom_window_served`
+/// in `RawLock::lock`, `axiom_window_cell` in `Lock::acquired`. Both are
+/// private to `lock.rs`.
 #[test]
 fn permission_axioms_are_called_only_at_acquisitions() {
     // Spelled in parts, so that this test's own lines match nothing.
     // A call is the name then `(` or a turbofish `::`.
-    let acquired = std::format!("{}{}", "axiom_", "acquired");
+    let cell = std::format!("{}{}", "axiom_", "window_cell");
     let served = std::format!("{}{}", "axiom_", "window_served");
     let calls = |t: &str, name: &str| {
         t.contains(std::format!("{name}(").as_str())
@@ -208,7 +209,8 @@ fn permission_axioms_are_called_only_at_acquisitions() {
     let mut a = Vec::new();
     let mut w = Vec::new();
     let mut func = "";
-    let mut prev = "";
+    // The last two code lines before this one.
+    let mut prev = ["", ""];
     for line in include_str!("../lock.rs").lines() {
         let t = line.trim();
         if t.starts_with("//") {
@@ -217,16 +219,35 @@ fn permission_axioms_are_called_only_at_acquisitions() {
         if let Some(i) = t.find("fn ") {
             func = t[i + 3..].split(['(', '<']).next().unwrap();
         }
-        if calls(t, &acquired) && !t.starts_with("axiom fn") {
-            a.push(func);
+        if calls(t, &cell) && !t.starts_with("axiom fn") {
+            a.push((func, prev));
         }
         if calls(t, &served) && !t.starts_with("axiom fn") {
             w.push((func, prev));
         }
-        prev = t;
+        prev = [prev[1], t];
     }
-    assert_eq!(a, ["lock", "try_lock", "lock_held_perm"]);
-    assert_eq!(w, [("lock_slow", "if fork_holder_is_me() {")]);
+    assert_eq!(
+        a,
+        [("acquired", ["(tok, out.tracked_unwrap())", "} else {"])]
+    );
+    assert_eq!(w, [("lock", ["tok = t.tracked_unwrap();", "} else {"])]);
+    // The branch tests `t is Some`, and `acquire` returns `None` only on
+    // the window's path.
+    let src = include_str!("../lock.rs");
+    let body = |f: &str| {
+        let at = src.find(f).unwrap();
+        &src[at..at + src[at..].find("\n    }\n").unwrap()]
+    };
+    for f in ["pub fn lock(&self)", "proof fn acquired("] {
+        assert_eq!(body(f).matches("if t is Some {").count(), 1, "{f}");
+    }
+    let slow = body("fn lock_slow(&self)");
+    assert_eq!(slow.matches("Tracked(None)").count(), 1);
+    assert!(
+        slow.contains("if fork_holder_is_me() {\n            return Tracked(None);\n        }"),
+        "`lock_slow` returns no token only on the window's path"
+    );
 }
 
 /// `in_child_fork_window` passes `axiom_child_window` the window's
@@ -470,11 +491,11 @@ fn root_lock_order_uses_are_listed() {
 fn raw_lock_state_machine() {
     let l = RawLock::new(Ghost::assume_new());
     assert!(!l.is_locked());
-    let (ok, mut t) = l.try_lock();
+    let (ok, t) = l.try_lock();
     assert!(ok);
     assert!(l.is_locked());
     assert!(!l.try_lock().0);
-    l.release_guard(&mut t);
+    l.release_some(t);
     assert!(!l.is_locked());
     assert_eq!(l.load(), UNLOCKED);
     let t = l.lock();

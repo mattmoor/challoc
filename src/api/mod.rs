@@ -2014,6 +2014,15 @@ impl ForkHeld {
         self.toks[k].held()
     }
 
+    /// Every hold but the arena creation lock's is a bare one
+    /// ([`LockHeld::raw`]: taken by `RawLock::lock_held`, released by
+    /// `RawLock::unlock_held`); the creation lock's is
+    /// `Lock::lock_held_perm`'s, with its cell's permission
+    /// ([`ForkHeld::created`]).
+    pub closed spec fn bare(self) -> bool {
+        forall|k: ForkLock| #[trigger] self.toks.contains_key(k) && k != ForkLock::Arenas ==> self.toks[k].raw()
+    }
+
     /// The content of [`FORK_SIGMASK`] as this hold's holder records it
     /// ([`save_sigmask`] records its argument), `None` before. Part of the
     /// hold because the slot is written and read only under every lock.
@@ -2063,6 +2072,7 @@ impl ForkHeld {
         assert(t.arenas() == self.arenas());
         assert(t.n() == self.n());
         assert(t.created() == self.created());
+        assert(t.toks == self.toks);
         assert forall|k: ForkLock| #[trigger] t.lock(k) == self.lock(k) by {}
     }
 
@@ -2077,6 +2087,7 @@ impl ForkHeld {
             final(self).saved() == old(self).saved(),
             final(self).no_slot() == old(self).no_slot(),
             final(self).created() == old(self).created(),
+            old(self).bare() && (k != ForkLock::Arenas ==> t.raw()) ==> final(self).bare(),
     {
         self.toks.tracked_insert(k, t);
     }
@@ -2094,6 +2105,8 @@ impl ForkHeld {
             final(self).saved() == old(self).saved(),
             final(self).no_slot() == old(self).no_slot(),
             final(self).created() == old(self).created(),
+            old(self).bare() ==> final(self).bare(),
+            old(self).bare() && k != ForkLock::Arenas ==> t.raw(),
     {
         self.toks.tracked_remove(k)
     }
@@ -2134,6 +2147,7 @@ impl ForkHeld {
         &&& s.arenas.frozen(self.created())
         &&& self.created().value().snap().0 as int == self.n()
         &&& self.created().value().snap().1 == self.arenas()
+        &&& self.bare()
         &&& forall|k: ForkLock|
             #![trigger self.keys().contains(k)]
             #![trigger self.lock(k)]
@@ -2400,6 +2414,8 @@ extern "C" fn fork_prepare() {
                 == ForkLock::Arenas || k == ForkLock::Stats || class_part(k, arenas.dom())),
             forall|k: ForkLock| #[trigger]
                 toks.contains_key(k) ==> toks[k].held() == lock_at(*s, arenas, k),
+            forall|k: ForkLock| #[trigger]
+                toks.contains_key(k) && k != ForkLock::Arenas ==> toks[k].raw(),
             ord.root(),
             ord.top() < rank_class(i as int, 0),
     {
@@ -2434,6 +2450,8 @@ extern "C" fn fork_prepare() {
                     k matches ForkLock::Class(j, d) && j == i && 0 <= d < c)),
                     forall|k: ForkLock| #[trigger]
                         toks.contains_key(k) ==> toks[k].held() == lock_at(*s, arenas, k),
+                    forall|k: ForkLock| #[trigger]
+                        toks.contains_key(k) && k != ForkLock::Arenas ==> toks[k].raw(),
                     ord.root(),
                     ord.top() < rank_class(i as int, c as int),
             {

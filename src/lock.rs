@@ -279,6 +279,18 @@ impl RawLock {
         self.try_acquire()
     }
 
+    /// [`RawLock::release`] of the token a successful [`RawLock::try_lock`]
+    /// returned, for the tests.
+    #[inline]
+    #[cfg(test)]
+    pub fn release_some(&self, Tracked(t): Tracked<Option<Unlocked>>)
+        requires
+            crate::sys::may_syscall(),
+            t matches Some(x) && self.is_token(x),
+    {
+        self.release(Tracked(t.tracked_unwrap()));
+    }
+
     /// Acquire, blocking as needed, and return the lock's token
     /// ([`Unlocked`]). Opens any invariant (stated, though it
     /// is Verus's default): a function that declares a narrower mask
