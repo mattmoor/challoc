@@ -19,13 +19,14 @@ use crate::sync::patomic::{PAtomicU32, PermissionU32};
 use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use vstd::cell::CellId;
 use vstd::cell::pcell::{PCell, PointsTo};
+#[cfg(verus_keep_ghost)]
+use vstd::invariant::OpenInvariantCredit;
 use vstd::invariant::{AtomicInvariant, InvariantPredicate};
 use vstd::prelude::*;
 use vstd::resource::Loc;
-use vstd::resource::ghost_var::GhostVar;
-#[cfg(verus_keep_ghost)]
-use vstd::resource::ghost_var::GhostVarAuth;
+use vstd::resource::ghost_var::{GhostVar, GhostVarAuth};
 
 verus! {
 
@@ -138,22 +139,41 @@ impl RawLock {
         ensures
             l.rank() == rank,
     {
+        let (l, _auth) = Self::new_paired(Ghost(rank));
+        l
+    }
+
+    /// [`RawLock::new`], with the other half of the lock's token: the
+    /// [`GhostVarAuth`] at the token's location, at `false`, which a
+    /// [`Lock`]'s cell invariant keeps ([`CellPred`]). A bare `RawLock`
+    /// drops it.
+    pub const fn new_paired(Ghost(rank): Ghost<int>) -> (r: (RawLock, Tracked<GhostVarAuth<bool>>))
+        requires
+            rank <= rank_state(),
+        ensures
+            r.0.rank() == rank,
+            r.1@.id() == r.0.token_loc(),
+            r.1@@ == false,
+    {
         // The word with its one permission, and the lock's token, both
         // into the word's invariant, at `UNLOCKED`.
         let (state, Tracked(perm)) = PAtomicU32::new(UNLOCKED);
-        let tracked (_auth, tok) = GhostVarAuth::<bool>::new(false);
+        let tracked (auth, tok) = GhostVarAuth::<bool>::new(false);
         let tracked inv = AtomicInvariant::<RawKey, RawVal, RawPred>::new(
             (state.id(), tok.id()),
             (perm, Some(tok)),
             raw_ns(),
         );
-        RawLock {
-            state,
-            #[cfg(verus_keep_ghost)]
-            rank: Ghost(rank),
-            #[cfg(verus_keep_ghost)]
-            inv: Tracked(inv),
-        }
+        (
+            RawLock {
+                state,
+                #[cfg(verus_keep_ghost)]
+                rank: Ghost(rank),
+                #[cfg(verus_keep_ghost)]
+                inv: Tracked(inv),
+            },
+            Tracked(auth),
+        )
     }
 
     /// The word's invariant is about this lock's word, in [`raw_ns`].
@@ -275,33 +295,56 @@ impl RawLock {
             self.is_token(t@),
         opens_invariants any
     {
-        let (ok, Tracked(t)) = self.try_acquire();
+        let Tracked(t) = self.acquire();
+        let tracked tok;
+        proof {
+            if t is Some {
+                tok = t.tracked_unwrap();
+            } else {
+                // The fork window served it ([`RawLock::acquire`]).
+                tok = axiom_window_served(*self);
+            }
+        }
+        Tracked(tok)
+    }
+
+    /// Acquire, blocking as needed: the lock's token, or `None` for an
+    /// acquisition the fork window served ([`RawLock::lock_slow`]), which
+    /// takes no token from the word.
+    #[inline]
+    fn acquire(&self) -> (t: Tracked<Option<Unlocked>>)
+        requires
+            crate::sys::may_syscall(),
+        ensures
+            t@ matches Some(x) ==> self.is_token(x),
+    {
+        let (ok, t) = self.try_acquire();
         if !ok {
             return self.lock_slow();
         }
-        Tracked(t.tracked_unwrap())
+        t
     }
 
     /// Termination is not claimed: the wait ends when another thread
     /// releases the lock.
     #[cold]
     #[verifier::exec_allows_no_decreases_clause]
-    fn lock_slow(&self) -> (t: Tracked<Unlocked>)
+    fn lock_slow(&self) -> (t: Tracked<Option<Unlocked>>)
         requires
             crate::sys::may_syscall(),
         ensures
-            self.is_token(t@),
+            t@ matches Some(x) ==> self.is_token(x),
     {
         // The forking thread inside the fork window already holds it
         // ([`fork_holder_is_me`]): served as acquired, released as a no-op.
         if fork_holder_is_me() {
-            return Tracked(axiom_window_served(*self));
+            return Tracked(None);
         }
         for _ in 0..SPINS {
             if self.load() == UNLOCKED {
-                let (ok, Tracked(t)) = self.try_acquire();
+                let (ok, t) = self.try_acquire();
                 if ok {
-                    return Tracked(t.tracked_unwrap());
+                    return t;
                 }
             }
             core::hint::spin_loop();
@@ -323,7 +366,7 @@ impl RawLock {
                 tok = t2;
             }
         }
-        Tracked(tok.tracked_unwrap())
+        Tracked(tok)
     }
 
     /// Release, handing the lock's token `t` back to the word's invariant.
@@ -345,6 +388,17 @@ impl RawLock {
         if fork_holder_is_me() {
             return;
         }
+        self.release_word(Tracked(t));
+    }
+
+    /// [`RawLock::release`] past its fork-window test: the swap to
+    /// `UNLOCKED` that hands the token back, and the wake.
+    #[inline(always)]
+    fn release_word(&self, Tracked(t): Tracked<Unlocked>)
+        requires
+            crate::sys::may_syscall(),
+            self.is_token(t),
+    {
         proof {
             use_type_invariant(self);
         }
@@ -359,20 +413,6 @@ impl RawLock {
         if prev == CONTENDED {
             wake(&self.state);
         }
-    }
-
-    /// [`RawLock::release`] of a guard's token, which the guard keeps in
-    /// `t` (`LockGuard::drop`, which cannot take it out of the guard
-    /// itself: it is trusted, and runs no proof code).
-    #[inline(always)]
-    #[allow(unused_variables)]
-    fn release_guard(&self, t: &mut Tracked<Option<Unlocked>>)
-        requires
-            crate::sys::may_syscall(),
-            old(t)@ matches Some(x) && self.is_token(x),
-    {
-        let tracked tok = t.borrow_mut().tracked_take();
-        self.release(Tracked(tok));
     }
 
     /// [`RawLock::lock`], returning the hold as a [`LockHeld`] token, for
@@ -390,6 +430,7 @@ impl RawLock {
             old(ord).allows(self.rank()),
         ensures
             t@.held() == *self,
+            t@.raw(),
             final(ord).root(),
             final(ord).top() == self.rank(),
             final(ord).ranks() == old(ord).ranks().insert(self.rank()),
@@ -410,6 +451,7 @@ impl RawLock {
         requires
             crate::sys::may_syscall(),
             t.held() == *self,
+            t.raw(),
             window_closed(),
             old(ord).root(),
         ensures
@@ -432,8 +474,9 @@ impl RawLock {
 }
 
 /// Premise (the fork window, design 9): an acquisition of `l` that the
-/// fork window served ([`RawLock::lock_slow`] on the path where
-/// [`fork_holder_is_me`] returned true) holds `l`'s token. The prepare
+/// fork window served ([`RawLock::acquire`] returned no token: the path
+/// of [`RawLock::lock_slow`] where [`fork_holder_is_me`] returned true)
+/// holds `l`'s token. The prepare
 /// handler took every allocator lock before it opened the window
 /// ([`fork_prepared`]), so its [`LockHeld`] has the real token, and the
 /// one this premise gives is a second one for the same hold: it stands for
@@ -441,12 +484,39 @@ impl RawLock {
 /// the release, which, in the window, does not touch the word
 /// ([`RawLock::release`] drops the token). Every lock the window serves is
 /// one the prepare handler took: no arena (and so no lock) is built there
-/// (`Arenas::create`, `Arenas::materialise`).
+/// (`Arenas::create`, `Arenas::materialise`). Its one use is
+/// [`RawLock::lock`]'s, for a bare raw lock; a [`Lock`]'s acquisitions
+/// take [`axiom_window_cell`] instead.
 ///
 /// Checked by `lock::tests::permission_axioms_are_called_only_at_acquisitions`.
 axiom fn axiom_window_served(l: RawLock) -> (tracked t: Unlocked)
     ensures
         l.is_token(t),
+;
+
+/// Premise (the fork window, design 9), for a [`Lock`]: an acquisition of
+/// `l` that the fork window served ([`RawLock::acquire`] returned no
+/// token) holds `l`'s token, as a holder of the cell's permission keeps
+/// it (at `true`, [`CellPred`]), and the permission of `l`'s cell, whose
+/// value satisfies [`lock_inv`] and keeps [`lock_frame`] of the value the
+/// lock was created with. As for [`axiom_window_served`], the prepare
+/// handler holds the lock (and, for the arena creation lock and the state
+/// lock, the permission: `api::ForkHeld`, `purge::background::StateHold`),
+/// and the token and permission this premise gives stand for that hold,
+/// used by the one thread that runs allocator code there, on the window's
+/// premise that the lock's data is as its last holder left it. The
+/// release in the window ([`Lock::release_cell`]) drops both without
+/// touching the cell's invariant or the word. Its one use is
+/// [`Lock::acquired`].
+///
+/// Checked by `lock::tests::permission_axioms_are_called_only_at_acquisitions`.
+axiom fn axiom_window_cell<T: LockSpec>(l: Lock<T>) -> (tracked r: (Unlocked, PointsTo<T>))
+    ensures
+        r.0.id() == l.spec_raw().token_loc(),
+        r.0@ == true,
+        l.has_perm(r.1),
+        lock_inv(*r.1.value()),
+        lock_frame(lock_init(l), *r.1.value()),
 ;
 
 /// Ghost: its owner holds the raw lock [`LockHeld::held`], and has its
@@ -464,7 +534,11 @@ axiom fn axiom_window_served(l: RawLock) -> (tracked t: Unlocked)
 /// thread alone follows from the word's invariant: the token is in the
 /// invariant exactly while the word is `UNLOCKED`, so outside the fork
 /// window ([`axiom_window_served`]) only the acquisition that moved the
-/// word off `UNLOCKED` took it.
+/// word off `UNLOCKED` took it. A hold of a [`Lock`] that also has the
+/// cell's permission ([`Lock::lock_held_perm`]) keeps the token at `true`
+/// ([`CellPred`]), so only [`Lock::unlock_held_perm`] releases it; a bare
+/// hold ([`RawLock::lock_held`]) keeps it at `false` ([`LockHeld::raw`]),
+/// as [`RawLock::unlock_held`] requires.
 // Ghost: built and read only by proof code.
 #[allow(dead_code)]
 pub tracked struct LockHeld {
@@ -476,7 +550,7 @@ impl LockHeld {
     /// The token is the lock's.
     #[verifier::type_invariant]
     closed spec fn wf(self) -> bool {
-        self.lock.is_token(self.tok)
+        self.tok.id() == self.lock.token_loc()
     }
 
     /// The lock this token holds.
@@ -484,10 +558,17 @@ impl LockHeld {
         self.lock
     }
 
+    /// A bare hold, with no permission of a cell taken under it: its
+    /// token is as the word's invariant keeps it ([`RawLock::is_token`]).
+    pub closed spec fn raw(self) -> bool {
+        self.tok@ == false
+    }
+
     /// The lock's token, for its release.
     proof fn into_token(tracked self) -> (tracked t: Unlocked)
         ensures
-            self.held().is_token(t),
+            t.id() == self.held().token_loc(),
+            self.raw() ==> self.held().is_token(t),
     {
         use_type_invariant(&self);
         self.tok
@@ -939,19 +1020,23 @@ fn wake(state: &PAtomicU32)
 /// A [`RawLock`] guarding a value.
 ///
 /// The value is a vstd [`PCell`]: reading or writing it takes the cell's
-/// [`PointsTo`] permission (ghost). The raw lock's invariant holds that
-/// permission while the lock is free: [`Lock::new`] hands it over, an
-/// acquisition takes it out ([`axiom_acquired`]) and the guard's drop,
-/// the release, puts it back; a holder with no guard
-/// ([`Lock::lock_held_perm`]) keeps it until it hands it back with its
-/// token ([`Lock::unlock_held_perm`]). That a free lock's invariant owns
-/// the permission, and that the futex mutex hands it to one holder at a
-/// time, is the mutex's contract, which Verus does not check (the atomics
-/// return any value); [`axiom_acquired`] states it. A `PCell` is a
+/// [`PointsTo`] permission (ghost). The lock's cell invariant
+/// ([`CellPred`]) holds that permission while no holder has it, with the
+/// other half of the raw lock's token ([`RawLock::new_paired`]):
+/// [`Lock::new`] hands both over. An acquisition takes the raw lock's
+/// token out of the word's invariant ([`RawPred`]), agrees it with the
+/// half here (both `false`: the permission is in), takes the permission
+/// and sets both halves to `true` ([`Lock::acquired`]). The release
+/// ([`Lock::release_cell`], from the guard's drop or
+/// [`Lock::unlock_held_perm`]) puts the permission back, with the value's
+/// [`lock_inv`] and [`lock_frame`], sets both halves to `false` and hands
+/// the token back to the word. So outside the fork window
+/// ([`axiom_window_cell`]) a holder's permission is the one the word's
+/// history gave. A `PCell` is a
 /// `ManuallyDrop<UnsafeCell<T>>`: the
 /// layout and the code of the `UnsafeCell` it replaces, except that
 /// dropping a `Lock` does not drop the value (no lock is dropped outside
-/// the tests).
+/// the tests). The cell invariant is a ghost field (zero-sized).
 #[verifier::reject_recursive_types(T)]
 pub struct Lock<T> {
     raw: RawLock,
@@ -959,6 +1044,54 @@ pub struct Lock<T> {
     /// Ghost: the value the lock was created with ([`lock_init`]).
     #[allow(dead_code)]
     init: Ghost<T>,
+    /// Ghost: the cell's invariant ([`CellPred`]).
+    #[allow(dead_code)]
+    cell: Tracked<CellInv<T>>,
+}
+
+/// What a lock's cell invariant is about: the cell's identity, the
+/// location of the raw lock's token, and the value the lock was created
+/// with ([`lock_init`]).
+// Ghost: ordinary builds keep the type but erase the code that reads it.
+#[allow(dead_code)]
+pub type CellKey<T> = (CellId, Loc, T);
+
+/// What a lock's cell invariant holds: the other half of the raw lock's
+/// token and, while no holder has it, the cell's permission.
+// Ghost: ordinary builds keep the type but erase the code that reads it.
+#[allow(dead_code)]
+pub type CellVal<T> = (GhostVarAuth<bool>, Option<PointsTo<T>>);
+
+/// The cell invariant of a [`Lock`]: the half is the token's, it is
+/// `false` exactly when the permission is in, and the permission is the
+/// cell's, with a value that satisfies [`lock_inv`] and keeps
+/// [`lock_frame`] of the value the lock was created with.
+// Ghost: ordinary builds keep the type but erase the code that reads it.
+#[allow(dead_code)]
+pub struct CellPred;
+
+impl<T: LockSpec> InvariantPredicate<CellKey<T>, CellVal<T>> for CellPred {
+    closed spec fn inv(k: CellKey<T>, v: CellVal<T>) -> bool {
+        &&& v.0.id() == k.1
+        &&& (v.0@ == false) == (v.1 is Some)
+        &&& v.1 matches Some(p) ==> {
+            &&& p.id() == k.0
+            &&& lock_inv(*p.value())
+            &&& lock_frame(k.2, *p.value())
+        }
+    }
+}
+
+/// A lock's cell invariant.
+// Ghost: ordinary builds keep the type but erase the code that reads it.
+#[allow(dead_code)]
+pub type CellInv<T> = AtomicInvariant<CellKey<T>, CellVal<T>, CellPred>;
+
+/// The namespace of every lock's cell invariant ("cell"). Only this
+/// module opens one, never inside another, and never inside a word's
+/// invariant ([`raw_ns`]).
+pub open spec fn cell_ns() -> int {
+    0x6365_6c6c
 }
 
 /// The invariant and frame of a locked type, stated by the type's owner:
@@ -1031,39 +1164,6 @@ pub open spec fn lock_frame<T: LockSpec>(init: T, v: T) -> bool {
 /// axiom, stated as for [`assumed_inv`].
 pub uninterp spec fn assumed_frame<T>(init: T, v: T) -> bool;
 
-/// The lock invariant's assumption where it enters, at an acquisition: a
-/// thread that has just acquired the raw lock of `l` takes the permission
-/// of `l`'s cell out of the raw lock's invariant, and the value in the cell
-/// satisfies [`lock_inv`] and keeps [`lock_frame`] of the value the lock
-/// was created with (every earlier holder that releases through
-/// [`LockGuard::unlock`] or [`Lock::unlock_held_perm`] restored both, and
-/// before the first holder [`Lock::new`] required both of that value,
-/// except for the per-arena statistics locks, which the trusted
-/// `Arena::put_stats` writes). Private, and
-/// used only right after an acquire: by [`Lock::lock`] and
-/// [`Lock::try_lock`], for the guard they build, which keeps the
-/// permission in a field private to this module until its drop releases
-/// the lock, and by [`Lock::lock_held_perm`], whose holder hands the
-/// permission back with the token to [`Lock::unlock_held_perm`]. A call
-/// while an earlier permission is alive would give two permissions to
-/// one cell, and nothing but that discipline stops such a call. In the
-/// fork window ([`fork_holder_is_me`]) an acquire the window serves is
-/// also followed by this call, for a cell whose permission the fork
-/// handlers' hold already has (`api::ForkHeld` for the arena creation
-/// lock's, `purge::background::StateHold` for the state lock's): the
-/// second permission stands for that hold, used by the one thread that
-/// runs allocator code there until the release, on the window's premise
-/// that the hold's data is as the last holder left it. Every lock the
-/// window serves is one the prepare handler took: no arena (and so no
-/// lock) is built there (`Arenas::create`, `Arenas::materialise`).
-///
-/// Checked by `lock::tests::permission_axioms_are_called_only_at_acquisitions`.
-axiom fn axiom_acquired<T: LockSpec>(l: Lock<T>) -> (tracked p: PointsTo<T>)
-    ensures
-        p.id() == l.value.id(),
-        lock_inv(*p.value()),
-        lock_frame(lock_init(l), *p.value()),
-;
 
 /// Alignment that keeps a lock (or any hot atomic) off the cache line of
 /// read-mostly data next to it. 128 bytes covers Apple silicon's 128-byte
@@ -1135,8 +1235,8 @@ impl<T> Lock<T> {
 
     /// A lock of rank `rank` (ghost) guarding `value`, at most the state
     /// lock's ([`RawLock::new`]). `value` satisfies [`lock_inv`] and keeps
-    /// [`lock_frame`] of itself, as [`axiom_acquired`] claims of it at the
-    /// first acquisition.
+    /// [`lock_frame`] of itself, which the cell invariant ([`CellPred`])
+    /// holds of it until the first acquisition.
     pub const fn new(value: T, Ghost(rank): Ghost<int>) -> (l: Lock<T>)
         where T: LockSpec
         requires
@@ -1147,9 +1247,116 @@ impl<T> Lock<T> {
             lock_init(l) == value,
             l.rank() == rank,
     {
-        // The permission goes to the free lock's invariant.
-        let (cell, _perm) = PCell::new(value);
-        Lock { raw: RawLock::new(Ghost(rank)), value: cell, init: Ghost(value) }
+        // The permission and the token's other half go to the cell's
+        // invariant.
+        let (cell, Tracked(perm)) = PCell::new(value);
+        let (raw, Tracked(auth)) = RawLock::new_paired(Ghost(rank));
+        let tracked inv = AtomicInvariant::<CellKey<T>, CellVal<T>, CellPred>::new(
+            (cell.id(), raw.token_loc(), value),
+            (auth, Some(perm)),
+            cell_ns(),
+        );
+        Lock { raw, value: cell, init: Ghost(value), cell: Tracked(inv) }
+    }
+
+    /// The cell's invariant is about this lock's cell, its raw lock's
+    /// token and its initial value, in [`cell_ns`].
+    #[verifier::type_invariant]
+    closed spec fn wf(&self) -> bool {
+        &&& self.cell@.constant() == (self.value.id(), self.raw.token_loc(), self.init@)
+        &&& self.cell@.namespace() == cell_ns()
+    }
+
+    /// The acquisition's half of the cell's hand-over: from the token `t`
+    /// [`RawLock::acquire`] returned, the token at `true` and the cell's
+    /// permission, which the cell's invariant gave up (the token at
+    /// `false` agrees with the invariant's half, so the permission was
+    /// in); for an acquisition the fork window served (`None`),
+    /// [`axiom_window_cell`]'s.
+    proof fn acquired(tracked &self, tracked t: Option<Unlocked>, tracked credit: OpenInvariantCredit) -> (tracked r: (Unlocked, PointsTo<T>))
+        where T: LockSpec
+        requires
+            t matches Some(x) ==> self.raw.is_token(x),
+        ensures
+            r.0.id() == self.raw.token_loc(),
+            r.0@ == true,
+            self.has_perm(r.1),
+            lock_inv(*r.1.value()),
+            lock_frame(lock_init(*self), *r.1.value()),
+        opens_invariants any
+    {
+        use_type_invariant(self);
+        if t is Some {
+            let tracked mut tok = t.tracked_unwrap();
+            let tracked mut out: Option<PointsTo<T>> = None;
+            vstd::open_atomic_invariant_in_proof!(credit => self.cell.borrow() => v => {
+                let tracked (mut auth, p) = v;
+                auth.agree(&tok);
+                auth.update(&mut tok, true);
+                out = p;
+                v = (auth, None);
+            });
+            (tok, out.tracked_unwrap())
+        } else {
+            axiom_window_cell(*self)
+        }
+    }
+
+    /// The release's half: the permission `perm` back into the cell's
+    /// invariant, with its value's [`lock_inv`] and [`lock_frame`], and
+    /// the token `t` (the hold's) back at `false`, for the word
+    /// ([`RawLock::release_word`]). The token is at `true` (a holder of
+    /// the permission's), or the invariant would hold a second
+    /// permission of the cell.
+    proof fn returned(tracked &self, tracked t: Unlocked, tracked perm: PointsTo<T>, tracked credit: OpenInvariantCredit) -> (tracked r: Unlocked)
+        where T: LockSpec
+        requires
+            t.id() == self.raw.token_loc(),
+            self.has_perm(perm),
+            lock_inv(*perm.value()),
+            lock_frame(lock_init(*self), *perm.value()),
+        ensures
+            self.raw.is_token(r),
+        opens_invariants any
+    {
+        use_type_invariant(self);
+        let tracked mut tok = t;
+        let tracked mut perm = perm;
+        vstd::open_atomic_invariant_in_proof!(credit => self.cell.borrow() => v => {
+            let tracked (mut auth, p) = v;
+            auth.agree(&tok);
+            if p is Some {
+                // A second permission of the cell: impossible.
+                perm.is_exclusive(p.tracked_borrow());
+            }
+            auth.update(&mut tok, false);
+            v = (auth, Some(perm));
+        });
+        tok
+    }
+
+    /// The release of a holder of the cell's permission: outside the fork
+    /// window, the permission and the token back ([`Lock::returned`]),
+    /// then the word ([`RawLock::release_word`]); inside it (the
+    /// acquisition was one the window served, [`axiom_window_cell`]),
+    /// nothing, as [`RawLock::release`]. The guard's drop calls it with
+    /// the guard's ghost fields.
+    #[inline(always)]
+    fn release_cell(&self, Tracked(t): Tracked<Unlocked>, Tracked(perm): Tracked<PointsTo<T>>)
+        where T: LockSpec
+        requires
+            crate::sys::may_syscall(),
+            t.id() == self.raw.token_loc(),
+            self.has_perm(perm),
+            lock_inv(*perm.value()),
+            lock_frame(lock_init(*self), *perm.value()),
+    {
+        if fork_holder_is_me() {
+            return;
+        }
+        let Tracked(credit) = vstd::invariant::create_open_invariant_credit();
+        let tracked tok = self.returned(t, perm, credit);
+        self.raw.release_word(Tracked(tok));
     }
 
     /// The lock's rank in the lock order ([`LockOrder`]).
@@ -1179,9 +1386,10 @@ impl<T> Lock<T> {
             !final(under).root(),
         opens_invariants any
     {
-        let Tracked(tok) = self.raw.lock();
-        let tracked perm = axiom_acquired(*self);
-        let g = LockGuard { lock: self, perm: Tracked(perm), tok: Tracked(Some(tok)) };
+        let Tracked(t) = self.raw.acquire();
+        let Tracked(credit) = vstd::invariant::create_open_invariant_credit();
+        let tracked (tok, perm) = self.acquired(t, credit);
+        let g = LockGuard { lock: self, perm: Tracked(perm), tok: Tracked(tok) };
         proof {
             *under = LockOrder { top: self.rank(), root: false, ranks: Set::empty(), life: PhantomData };
         }
@@ -1203,10 +1411,11 @@ impl<T> Lock<T> {
         ensures
             r matches Some(g) ==> lock_inv(g@) && lock_frame(lock_init(*self), g@) && g.spec_lock() == *self,
     {
-        let (ok, t) = self.raw.try_lock();
+        let (ok, Tracked(t)) = self.raw.try_lock();
         if ok {
-            let tracked perm = axiom_acquired(*self);
-            Some(LockGuard { lock: self, perm: Tracked(perm), tok: t })
+            let Tracked(credit) = vstd::invariant::create_open_invariant_credit();
+            let tracked (tok, perm) = self.acquired(t, credit);
+            Some(LockGuard { lock: self, perm: Tracked(perm), tok: Tracked(tok) })
         } else {
             None
         }
@@ -1265,12 +1474,14 @@ impl<T> Lock<T> {
             final(ord).ranks() == old(ord).ranks().insert(self.rank()),
             self.rank() == rank_state() ==> fork_prepared(*final(ord)),
     {
-        let Tracked(tok) = self.raw.lock();
+        let Tracked(t) = self.raw.acquire();
+        let Tracked(credit) = vstd::invariant::create_open_invariant_credit();
+        let tracked (tok, perm) = self.acquired(t, credit);
         proof {
             ord.top = self.rank();
             ord.ranks = ord.ranks.insert(self.rank());
         }
-        Tracked((LockHeld { lock: self.raw, tok }, axiom_acquired(*self)))
+        Tracked((LockHeld { lock: self.raw, tok }, perm))
     }
 
     /// The value, read through the permission `perm` of the cell, which a
@@ -1332,7 +1543,7 @@ impl<T> Lock<T> {
         proof {
             ord.ranks = ord.ranks.remove(t.held().rank());
         }
-        self.raw.release(Tracked(t.into_token()));
+        self.release_cell(Tracked(t.into_token()), Tracked(perm));
     }
 }
 
@@ -1340,23 +1551,24 @@ impl<T> Lock<T> {
 /// permission of the lock's cell, taken at the acquisition
 /// ([`axiom_acquired`]), until the drop releases the lock.
 #[verifier::reject_recursive_types(T)]
-pub struct LockGuard<'a, T> {
+pub struct LockGuard<'a, T: LockSpec> {
     lock: &'a Lock<T>,
     /// Ghost: the permission of the lock's cell.
     #[allow(dead_code)]
     perm: Tracked<PointsTo<T>>,
-    /// Ghost: the lock's token ([`Unlocked`]), which the drop's release
-    /// hands back to the word's invariant.
+    /// Ghost: the lock's token ([`Unlocked`], at `true` while the
+    /// permission is out of the cell's invariant), which the drop's
+    /// release hands back.
     #[allow(dead_code)]
-    tok: Tracked<Option<Unlocked>>,
+    tok: Tracked<Unlocked>,
 }
 
-impl<'a, T> LockGuard<'a, T> {
+impl<'a, T: LockSpec> LockGuard<'a, T> {
     /// The permission is the cell's, and the token the lock's.
     #[verifier::type_invariant]
     closed spec fn wf(&self) -> bool {
         &&& self.perm@.id() == self.lock.value.id()
-        &&& self.tok@ matches Some(t) && self.lock.raw.is_token(t)
+        &&& self.tok@.id() == self.lock.raw.token_loc()
     }
 
     /// The lock this guard holds.
@@ -1396,7 +1608,7 @@ impl<'a, T> LockGuard<'a, T> {
     }
 }
 
-impl<'a, T> View for LockGuard<'a, T> {
+impl<'a, T: LockSpec> View for LockGuard<'a, T> {
     type V = T;
 
     /// The guarded value: the cell's, through the guard's permission.
@@ -1405,7 +1617,7 @@ impl<'a, T> View for LockGuard<'a, T> {
     }
 }
 
-impl<T> Deref for LockGuard<'_, T> {
+impl<T: LockSpec> Deref for LockGuard<'_, T> {
     type Target = T;
     #[inline]
     fn deref(&self) -> (r: &T)
@@ -1419,7 +1631,7 @@ impl<T> Deref for LockGuard<'_, T> {
     }
 }
 
-impl<T> DerefMut for LockGuard<'_, T> {
+impl<T: LockSpec> DerefMut for LockGuard<'_, T> {
     #[inline]
     fn deref_mut(&mut self) -> (r: &mut T)
         ensures
@@ -1474,19 +1686,28 @@ fn cell_mut<'b, T>(c: &'b PCell<T>, t: &'b mut Tracked<PointsTo<T>>) -> (r: &'b 
 }
 
 // Trusted: Verus wants a destructor that opens no invariant and cannot
-// unwind, and `RawLock::release` opens the word's invariant and is not
-// marked `no_unwind`. The body is the release of the guard's token
-// (`RawLock::release_guard`, whose requirement the guard's type invariant
-// gives), and claims nothing; its `no_unwind` rests on the
+// unwind, and `Lock::release_cell` opens the cell's and the word's
+// invariants and is not marked `no_unwind`. The body is the release of the
+// guard's token and permission (`Lock::release_cell`), and claims nothing.
+// It reads the two ghost fields out of the guard (`Tracked` is zero-sized,
+// so the reads copy nothing; the guard is gone after the drop, so each is
+// handed over once). The requirement it does not check: the token and
+// permission are the lock's (the guard's type invariant gives it), and the
+// value keeps `lock_inv` and `lock_frame` (a guard that ends with
+// `LockGuard::unlock` checks it there; for a guard that drops instead it
+// is the assumption `lock_inv` describes). Its `no_unwind` rests on the
 // `panic = "abort"` profiles (test builds unwind).
-impl<T> Drop for LockGuard<'_, T> {
+impl<T: LockSpec> Drop for LockGuard<'_, T> {
     #[inline]
     #[verifier::external_body]
     fn drop(&mut self)
         opens_invariants none
         no_unwind
     {
-        self.lock.raw.release_guard(&mut self.tok);
+        // SAFETY: both fields are zero-sized and read once, as the guard
+        // ends.
+        let (tok, perm) = unsafe { (core::ptr::read(&self.tok), core::ptr::read(&self.perm)) };
+        self.lock.release_cell(tok, perm);
     }
 }
 
