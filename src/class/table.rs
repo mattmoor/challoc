@@ -747,6 +747,18 @@ impl BitLoad {
         BitLoad { toks: Set::empty(), seen: None }
     }
 
+    /// A record of a release ([`AtomicBitmap::release`](crate::bitmap::AtomicBitmap::release)'s
+    /// witness `w`, #850), for a caller to pass to the bit test so its load
+    /// is ordered after the release ([`SlabTable::load_after`]). It holds
+    /// no tokens, and its witness is a real one: only the word invariants
+    /// make them.
+    pub proof fn of_release(tracked w: GhostPersistentISingleton<(int, nat, u64)>) -> (tracked r: BitLoad)
+        ensures
+            r.seen() == Some((w.id(), w@)),
+    {
+        BitLoad { toks: Set::empty(), seen: Some(w) }
+    }
+
     /// `self` is no older than `l0` for word `j` of the class bitmap whose
     /// seen values are at `loc`: if `l0` holds a witness of that word,
     /// `self` holds one too, its version is at least `l0`'s, and at the
@@ -762,6 +774,22 @@ impl BitLoad {
             None => true,
         }
     }
+}
+
+/// A load that is no older than a record `l0` of word `j` in which bit `k`
+/// was clear (a release's, [`BitLoad::of_release`]) and that finds the
+/// bit set read a strictly newer version: the word was written again
+/// after `l0`, so the slot was claimed again after its release (#850).
+/// This is the stale free's exact form: a `free` whose check is ordered
+/// after the release of its slot and passes saw a later claim of it.
+pub proof fn lemma_claimed_again(l0: BitLoad, l1: BitLoad, loc: Loc, j: int, k: u64)
+    requires
+        l0.seen() matches Some(w0) && w0.0 == loc && w0.1.0 == j && !crate::bitmap::has_bit(w0.1.2, k),
+        l1.after(l0, loc, j),
+        l1.seen() matches Some(w1) && crate::bitmap::has_bit(w1.1.2, k),
+    ensures
+        l0.seen()->Some_0.1.1 < l1.seen()->Some_0.1.1,
+{
 }
 
 /// `p` is an initialised permission to the `T` at `addr`, through a
