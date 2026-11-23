@@ -4119,11 +4119,18 @@ impl SlabTable {
         l1.after(l0, self.spec_slots().hloc, (slab * class_table()[self.spec_class() as int].slab_bits + slot) / 64)
     }
 
-    /// [`SlabTable::load_after`] at the word of the slot at address `a`
-    /// ([`crate::bitmap::bit_of`]): the form a release record, kept by
-    /// address, names (#843).
-    pub open spec fn load_after_addr(&self, a: int, l0: BitLoad, l1: BitLoad) -> bool {
-        l1.after(l0, self.spec_slots().hloc, crate::bitmap::bit_of(self.spec_slots(), a) / 64)
+    /// The stale free's conclusion at the slot at address `a` (#843): when
+    /// `l0` holds a release record of the slot (the word value its release
+    /// left, the slot's bit clear, [`crate::bitmap::released_at`] at
+    /// [`crate::bitmap::bit_of`]), `l1` read a strictly newer version of
+    /// the word, so the slot was claimed again after that release
+    /// ([`lemma_check_after_release`]).
+    pub open spec fn claimed_since(&self, a: int, l0: BitLoad, l1: BitLoad) -> bool {
+        l0.seen() matches Some(w0) ==> (crate::bitmap::released_at(
+            self.spec_slots(),
+            w0,
+            crate::bitmap::bit_of(self.spec_slots(), a),
+        ) ==> w0.1.1 < l1.seen()->Some_0.1.1)
     }
 
     /// The `free` check's bit (design 4): whether `slot` of `slab`
@@ -4860,14 +4867,8 @@ impl SlabTable {
             !slot_free_at(final(obs).toks(), self.spec_class() as int, slab as int, slot as int),
             self.load_seen(slab as int, slot as int, *final(obs)),
             self.load_after(slab as int, slot as int, *old(obs), *final(obs)),
-            // A stale free that passes saw a later claim of the slot: `obs`
-            // held a release record of it, and the load read a strictly
-            // newer version of the word (#843).
-            old(obs).seen() matches Some(w0) ==> (crate::bitmap::released_at(
-                self.spec_slots(),
-                w0,
-                crate::bitmap::bit_of(self.spec_slots(), process_regions().slot_at(self.spec_class() as int, slab as int, slot as int)),
-            ) ==> w0.1.1 < final(obs).seen()->Some_0.1.1),
+            // A stale free that passes saw a later claim of the slot (#843).
+            self.claimed_since(process_regions().slot_at(self.spec_class() as int, slab as int, slot as int), *old(obs), *final(obs)),
     {
         let ghost o0 = *obs;
         if !self.is_handed_out(slab) {
@@ -6119,18 +6120,26 @@ impl SlabTable {
             self.load_seen(slab as int, slot as int, *final(obs)),
             // No older than what `obs` held (a release's record, #843).
             self.load_after(slab as int, slot as int, *old(obs), *final(obs)),
-            self.load_after_addr(process_regions().slot_at(self.spec_class() as int, slab as int, slot as int), *old(obs), *final(obs)),
+            // A set bit after a release record of the slot: a later claim.
+            (x >> (bit % 64)) & 1 != 0 ==> self.claimed_since(
+                process_regions().slot_at(self.spec_class() as int, slab as int, slot as int),
+                *old(obs),
+                *final(obs),
+            ),
         opens_invariants [crate::bitmap::word_ns()]
     {
         let tracked none = None;
+        let ghost o0 = *obs;
         // SAFETY: guaranteed by the caller.
-        let x = unsafe { self.bit_word_held(bits_base, index, Ghost(slab), Ghost(slot), Ghost(bit), Tracked(&none), Tracked(obs)) };
+        let x = unsafe { self.bit_word_held(bits_base, index, Ghost(slab), Ghost(slot), Ghost(bit), Tracked(&none), Tracked(&mut *obs)) };
         proof {
             assert(bit as int / 64 == (slab as int * class_table()[self.spec_class() as int].slab_bits + slot as int) / 64);
-            // The slot's address names the same bit, so the same word.
-            use_type_invariant(self);
-            self.lemma_slot_bit(slab as int, slot as int);
-            crate::bitmap::lemma_bit_of(self.spec_slots(), slab as int * self.spec_slots().sb + slot as int);
+            let s = self.spec_slots();
+            let a = process_regions().slot_at(self.spec_class() as int, slab as int, slot as int);
+            if (x >> (bit % 64)) & 1 != 0 && o0.seen() is Some && crate::bitmap::released_at(s, o0.seen()->Some_0, crate::bitmap::bit_of(s, a)) {
+                use_type_invariant(self);
+                lemma_check_after_release(*self, slab as int, slot as int, o0, *obs);
+            }
         }
         x
     }

@@ -952,8 +952,8 @@ impl ClassLine {
             r matches Some(slab) ==> slab == p.wrapping_sub(crate::layout::process_regions().class_base[table.spec_class() as int])
                 >> class_table()[table.spec_class() as int].lg_slab,
             r is Some ==> crate::class::bit_seen_at(*table, p as int, *final(obs)),
-            // The load is no older than what `obs` held (#843).
-            r is Some ==> table.load_after_addr(p as int, *old(obs), *final(obs)),
+            // A pass after a release record of the slot: a later claim (#843).
+            r is Some ==> table.claimed_since(p as int, *old(obs), *final(obs)),
         opens_invariants [crate::bitmap::word_ns(), crate::class::committed_ns()]
     {
         let ghost c = table.spec_class() as int;
@@ -3309,8 +3309,8 @@ impl Shared {
     /// word value its release left, the slot's bit clear,
     /// [`crate::bitmap::released_at`]), a slot that passes the test was
     /// read at a strictly newer version of its word, so it was claimed
-    /// again after that release ([`crate::class::lemma_check_after_release`]).
-    /// `obs` is left the test's record.
+    /// again after that release ([`SlabTable::claimed_since`]). `obs` is
+    /// left the test's record.
     #[inline(always)]
     pub fn classify_free_after(&self, p: *mut u8, Tracked(claim): Tracked<&mut Claim>, Tracked(obs): Tracked<&mut crate::class::BitLoad>) -> (r: Result<(usize, u16), usize>)
         requires
@@ -3319,11 +3319,7 @@ impl Shared {
             self.wf(),
         ensures
             // A stale free that passes saw a later claim of its slot.
-            r matches Ok((c, _)) ==> (old(obs).seen() matches Some(w0) ==> (crate::bitmap::released_at(
-                self.spec_tables()[c as int].spec_slots(),
-                w0,
-                crate::bitmap::bit_of(self.spec_tables()[c as int].spec_slots(), p@.addr as int),
-            ) ==> w0.1.1 < final(obs).seen()->Some_0.1.1)),
+            r matches Ok((c, _)) ==> self.spec_tables()[c as int].claimed_since(p@.addr as int, *old(obs), *final(obs)),
             r is Ok ==> final(claim).held is Some,
             final(claim).claims(p),
             old(claim).held is Some ==> *final(claim) == *old(claim),
@@ -4398,8 +4394,8 @@ impl Shared {
             r matches Some((c, s)) ==> s == p@.addr.wrapping_sub(crate::layout::process_regions().class_base[c as int])
                 >> class_table()[c as int].lg_slab,
             r is Some ==> crate::heap::slot_checked(p, *final(obs)),
-            // The load is no older than what `obs` held (#843).
-            r matches Some((c, _)) ==> self.tables[c as int].load_after_addr(p@.addr as int, *old(obs), *final(obs)),
+            // A pass after a release record of the slot: a later claim (#843).
+            r matches Some((c, _)) ==> self.tables[c as int].claimed_since(p@.addr as int, *old(obs), *final(obs)),
         opens_invariants [crate::bitmap::word_ns(), crate::class::committed_ns()]
     {
         let ghost pp = p;
