@@ -5677,6 +5677,8 @@ impl ClassState {
                 t.lemma_slot_bit(slab as int, 64 * word + b);
             }
         }
+        // `wit` is read only in the proof below.
+        #[cfg_attr(not(verus_keep_ghost), allow(unused_variables))]
         let (prev, was_full, wit) = bm.release(word, mask, Tracked(tok));
         proof {
             broadcast use {vstd::set_lib::range_set_properties, vstd::set::lemma_set_filter};
