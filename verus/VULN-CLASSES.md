@@ -225,8 +225,11 @@ rows marked *(C)*, interface *(live)* cells). What is proved:
   after the slot's release that passes saw a later claim of the slot
   (`lemma_claimed_again`,
   [#850](https://github.com/chainguard-project-theseus/challoc/issues/850));
-  that the second free's check is ordered after the release is C's. A
-  fact about the load, not C's view. The plain frees (`free`,
+  that the second free's check is ordered after the release is C's,
+  except after a release by the same heap's flush, whose record of the
+  slot `Heap::free` passes to its check (`CachePerms::rels`,
+  `SlabTable::claimed_since`; the entry points' fast path
+  `free_fast_slot` does not yet). A fact about the load, not C's view. The plain frees (`free`,
   `delete`), `challoc_free_usable`, `dallocx` and the reallocations
   (`realloc`, `challoc_realloc_usable`, `rallocx`) take C's token for a
   slot start only past this test, with its record:
