@@ -805,6 +805,48 @@ pub proof fn lemma_claimed_again(l0: BitLoad, l1: BitLoad, loc: Loc, j: int, k: 
 {
 }
 
+/// The stale free's form at a slot of `t` (#843): `l0` records a word
+/// value of the slot's word with the slot's bit clear (a release's,
+/// [`crate::bitmap::released`] at the slot's address,
+/// [`crate::bitmap::bit_of`]), and `l1` is the free check's load, no older
+/// than `l0` ([`SlabTable::load_after`]), that found the slot
+/// allocated ([`SlabTable::load_seen`], not [`slot_free_at`]). Then `l1`
+/// read a strictly newer version of the word: the slot was claimed again
+/// after the release ([`lemma_claimed_again`]).
+proof fn lemma_check_after_release(t: SlabTable, slab: int, slot: int, l0: BitLoad, l1: BitLoad)
+    requires
+        t.inv(),
+        0 <= slab < t.spec_nslabs(),
+        0 <= slot < class_table()[t.spec_class() as int].nslots,
+        l0.seen() matches Some(w0) && crate::bitmap::released_at(
+            t.spec_slots(),
+            w0,
+            crate::bitmap::bit_of(t.spec_slots(), process_regions().slot_at(t.spec_class() as int, slab, slot)),
+        ),
+        t.load_after(slab, slot, l0, l1),
+        t.load_seen(slab, slot, l1),
+        !slot_free_at(l1.toks(), t.spec_class() as int, slab, slot),
+    ensures
+        l0.seen()->Some_0.1.1 < l1.seen()->Some_0.1.1,
+{
+    t.lemma_slot_bit(slab, slot);
+    let s = t.spec_slots();
+    let b = slab * s.sb + slot;
+    crate::bitmap::lemma_bit_of(s, b);
+    let j = b / 64;
+    let x1 = l1.seen()->Some_0.1.2;
+    let k = (b % 64) as u64;
+    // The slot's bit is set in `x1`: otherwise it is a free bit of word
+    // `j`, and its address one of the load's tokens.
+    if !crate::bitmap::has_bit(x1, k) {
+        assert(crate::bitmap::free_bits(s, j, x1).contains(b));
+        assert(crate::bitmap::addrs(s, crate::bitmap::free_bits(s, j, x1)).contains(s.addr(b))) by {
+            broadcast use Set::lemma_map_contains;
+        }
+    }
+    lemma_claimed_again(l0, l1, s.hloc, j, k);
+}
+
 /// The bit test's record `l` found the slot at address `a` allocated in
 /// `t`'s bitmap: for the slab and slot at `a` (a real slab and slot, so
 /// the pair is `a`'s own: [`lemma_bit_seen_at_own`]), `l` is a load of
@@ -4077,6 +4119,13 @@ impl SlabTable {
         l1.after(l0, self.spec_slots().hloc, (slab * class_table()[self.spec_class() as int].slab_bits + slot) / 64)
     }
 
+    /// [`SlabTable::load_after`] at the word of the slot at address `a`
+    /// ([`crate::bitmap::bit_of`]): the form a release record, kept by
+    /// address, names (#843).
+    pub open spec fn load_after_addr(&self, a: int, l0: BitLoad, l1: BitLoad) -> bool {
+        l1.after(l0, self.spec_slots().hloc, crate::bitmap::bit_of(self.spec_slots(), a) / 64)
+    }
+
     /// The `free` check's bit (design 4): whether `slot` of `slab`
     /// is marked allocated (or cached). One `SeqCst` load of the bitmap
     /// word (vstd `PAtomicU64`), through its permission, no bounds checks. A set bit is not a
@@ -4811,18 +4860,35 @@ impl SlabTable {
             !slot_free_at(final(obs).toks(), self.spec_class() as int, slab as int, slot as int),
             self.load_seen(slab as int, slot as int, *final(obs)),
             self.load_after(slab as int, slot as int, *old(obs), *final(obs)),
+            // A stale free that passes saw a later claim of the slot: `obs`
+            // held a release record of it, and the load read a strictly
+            // newer version of the word (#843).
+            old(obs).seen() matches Some(w0) ==> (crate::bitmap::released_at(
+                self.spec_slots(),
+                w0,
+                crate::bitmap::bit_of(self.spec_slots(), process_regions().slot_at(self.spec_class() as int, slab as int, slot as int)),
+            ) ==> w0.1.1 < final(obs).seen()->Some_0.1.1),
     {
+        let ghost o0 = *obs;
         if !self.is_handed_out(slab) {
             never_committed(self.class as usize, slab);
         }
         debug_assert!(slot < self.class().nslots());
         // SAFETY: below a value the watermark held, slot below `nslots`.
-        if !unsafe { self.is_set_unchecked(slab, slot, Tracked(held), Tracked(obs)) } {
+        if !unsafe { self.is_set_unchecked(slab, slot, Tracked(held), Tracked(&mut *obs)) } {
             proof {
                 // A live slot's bit is set: the caller holds no token of it.
                 assert(!holds_slot(*held, self.spec_class() as int, slab as int, slot as int));
             }
             self.not_live(slab, slot, p);
+        }
+        proof {
+            let s = self.spec_slots();
+            let a = process_regions().slot_at(self.spec_class() as int, slab as int, slot as int);
+            if o0.seen() is Some && crate::bitmap::released_at(s, o0.seen()->Some_0, crate::bitmap::bit_of(s, a)) {
+                use_type_invariant(self);
+                lemma_check_after_release(*self, slab as int, slot as int, o0, *obs);
+            }
         }
     }
 
@@ -6053,6 +6119,7 @@ impl SlabTable {
             self.load_seen(slab as int, slot as int, *final(obs)),
             // No older than what `obs` held (a release's record, #843).
             self.load_after(slab as int, slot as int, *old(obs), *final(obs)),
+            self.load_after_addr(process_regions().slot_at(self.spec_class() as int, slab as int, slot as int), *old(obs), *final(obs)),
         opens_invariants [crate::bitmap::word_ns()]
     {
         let tracked none = None;
@@ -6060,6 +6127,10 @@ impl SlabTable {
         let x = unsafe { self.bit_word_held(bits_base, index, Ghost(slab), Ghost(slot), Ghost(bit), Tracked(&none), Tracked(obs)) };
         proof {
             assert(bit as int / 64 == (slab as int * class_table()[self.spec_class() as int].slab_bits + slot as int) / 64);
+            // The slot's address names the same bit, so the same word.
+            use_type_invariant(self);
+            self.lemma_slot_bit(slab as int, slot as int);
+            crate::bitmap::lemma_bit_of(self.spec_slots(), slab as int * self.spec_slots().sb + slot as int);
         }
         x
     }

@@ -3756,9 +3756,15 @@ pub type SeenWitness = GhostPersistentISingleton<(int, nat, u64)>;
 /// ([`AtomicBitmap::release`]), which a later check of the slot is
 /// ordered after (#843).
 pub open spec fn released(s: Slots, w: SeenWitness, b: int) -> bool {
-    &&& w.id() == s.hloc
-    &&& w@.0 == b / 64
-    &&& !has_bit(w@.2, (b % 64) as u64)
+    released_at(s, (w.id(), w@), b)
+}
+
+/// [`released`] on a witness's location and value, the form a bit test's
+/// record names (`class::BitLoad::seen`).
+pub open spec fn released_at(s: Slots, w: (Loc, (int, nat, u64)), b: int) -> bool {
+    &&& w.0 == s.hloc
+    &&& w.1.0 == b / 64
+    &&& !has_bit(w.1.2, (b % 64) as u64)
 }
 
 /// Every entry of `rel` is a release record of its bit ([`released`]).
