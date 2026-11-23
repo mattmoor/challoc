@@ -3736,7 +3736,7 @@ pub open spec fn rel_ok(s: Slots, rel: Map<int, SeenWitness>) -> bool {
 /// its other entries (a release's witness, for each slot it released).
 pub proof fn lemma_record(tracked rel: &mut Map<int, SeenWitness>, tracked w: &SeenWitness, bits: Set<int>)
     ensures
-        forall|b: int| #[trigger] bits.contains(b) ==> final(rel).contains_key(b) && final(rel)[b] == *w,
+        forall|b: int| #[trigger] bits.contains(b) ==> final(rel).contains_key(b) && final(rel)[b].id() == w.id() && final(rel)[b]@ == w@,
         forall|b: int| !bits.contains(b) && #[trigger] old(rel).contains_key(b) ==> final(rel).contains_key(b) && final(rel)[b] == old(rel)[b],
         forall|b: int| #[trigger] final(rel).contains_key(b) ==> bits.contains(b) || old(rel).contains_key(b),
     decreases bits.len(),
@@ -3746,11 +3746,28 @@ pub proof fn lemma_record(tracked rel: &mut Map<int, SeenWitness>, tracked w: &S
             assert(bits =~= Set::empty());
         }
         let b = choose|b: int| bits.contains(b);
+        let ghost r0 = *rel;
         let tracked c = w.duplicate();
         rel.tracked_insert(b, c);
         let ghost mid = *rel;
-        lemma_record(rel, w, bits.remove(b));
+        let ghost rest = bits.remove(b);
+        lemma_record(rel, w, rest);
+        assert(mid.contains_key(b) && !rest.contains(b));
         assert(rel.contains_key(b) && rel[b] == mid[b]);
+        assert forall|x: int| !bits.contains(x) && #[trigger] r0.contains_key(x) implies rel.contains_key(x) && rel[x] == r0[x] by {
+            assert(mid.contains_key(x) && mid[x] == r0[x]);
+            assert(!rest.contains(x));
+        }
+        assert forall|x: int| #[trigger] bits.contains(x) implies rel.contains_key(x) && rel[x].id() == w.id() && rel[x]@ == w@ by {
+            if x != b {
+                assert(rest.contains(x));
+            }
+        }
+        assert forall|x: int| #[trigger] rel.contains_key(x) implies bits.contains(x) || r0.contains_key(x) by {
+            if !rest.contains(x) && x != b {
+                assert(mid.contains_key(x));
+            }
+        }
     } else {
         assert(bits =~= Set::empty());
     }
