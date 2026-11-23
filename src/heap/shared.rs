@@ -3987,7 +3987,10 @@ impl Shared {
             proof {
                 self.lemma_published_tables(*ow@, *oa);
             }
-            done += oa.class(class).release_owned(&ptrs[done..], Tracked(&mut *bag), ow, Tracked(ord));
+            // The release witnesses (#843) are per arena's table; none is
+            // kept here yet.
+            let tracked mut rel: vstd::map::Map<int, crate::bitmap::SeenWitness> = vstd::map::Map::tracked_empty();
+            done += oa.class(class).release_owned(&ptrs[done..], Tracked(&mut *bag), Tracked(&mut rel), ow, Tracked(ord));
             proof {
                 let r = done - d0;
                 crate::class::lemma_aset_split(pa, d0, done as int, ptrs@.len() as int);

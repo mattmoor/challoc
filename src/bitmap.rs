@@ -3427,6 +3427,40 @@ pub proof fn lemma_addr_inj(s: Slots, b1: int, b2: int)
     vstd::arithmetic::div_mod::lemma_fundamental_div_mod(b2, s.sb);
 }
 
+/// The bit of the slot at address `a` (#843): the one real bit whose
+/// address is `a`, when there is one ([`lemma_bit_of`]).
+pub open spec fn bit_of(s: Slots, a: int) -> int {
+    choose|b: int| s.real(b) && s.addr(b) == a
+}
+
+/// A real bit is the bit of its slot's address.
+pub proof fn lemma_bit_of(s: Slots, b: int)
+    requires
+        s.wf(),
+        s.real(b),
+    ensures
+        bit_of(s, s.addr(b)) == b,
+{
+    let c = bit_of(s, s.addr(b));
+    assert(s.real(c) && s.addr(c) == s.addr(b));
+    lemma_addr_inj(s, b, c);
+}
+
+/// A slot of `addrs(s, bits)`, for real `bits`, has its bit in `bits`.
+pub proof fn lemma_bit_of_addrs(s: Slots, bits: Set<int>, a: int)
+    requires
+        s.wf(),
+        forall|x: int| #[trigger] bits.contains(x) ==> s.real(x),
+        addrs(s, bits).contains(a),
+    ensures
+        bits.contains(bit_of(s, a)),
+        s.addr(bit_of(s, a)) == a,
+{
+    broadcast use Set::lemma_map_contains;
+    let b = choose|b: int| bits.contains(b) && s.addr(b) == a;
+    lemma_bit_of(s, b);
+}
+
 /// The addresses of a difference of slot sets are the difference of their
 /// addresses.
 pub proof fn lemma_addrs_difference(s: Slots, a: Set<int>, b: Set<int>)
