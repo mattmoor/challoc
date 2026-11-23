@@ -616,10 +616,11 @@ impl Heap {
             // The `FOREIGN` cache's batch starts wherever its first slab
             // belongs; `release_routed` follows the owner words from there.
             let owner = if arena == FOREIGN { shared.arena_of_slot(class, *high.get_unchecked(0)) } else { arena };
-            // The release records (#843); not kept by the heap yet.
+            // The release records (#843), kept in the heap's `rels`.
             let tracked mut rel: Map<int, crate::bitmap::RelRec> = Map::tracked_empty();
             shared.release_routed(owner, class, high, Tracked(&mut bag), Tracked(&mut rel), Tracked(ord));
             proof {
+                perms.rels.absorb(rel);
                 // Every cached slot is kept or released.
                 let hr = ptr_addrs(high@);
                 lemma_flush_split(aold, akept, ptr_addrs(h1), hr);

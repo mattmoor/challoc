@@ -3824,6 +3824,73 @@ pub proof fn lemma_by_addr(tracked out: &mut Map<int, RelRec>, tracked bits: &Ma
     }
 }
 
+/// A heap's release records (#843), by address: every one is a release
+/// record of the slot at its key ([`rec_ok`]), by the type's invariant,
+/// so the heap's invariants need not carry it.
+#[cfg_attr(not(verus_keep_ghost), allow(dead_code))]
+pub tracked struct Rels {
+    tracked m: Map<int, RelRec>,
+}
+
+impl Rels {
+    #[verifier::type_invariant]
+    spec fn inv(self) -> bool {
+        rec_ok(self.m)
+    }
+
+    /// The records.
+    pub closed spec fn map(self) -> Map<int, RelRec> {
+        self.m
+    }
+
+    /// No records.
+    pub proof fn tracked_empty() -> (tracked r: Rels)
+        ensures
+            r.map() == Map::<int, RelRec>::empty(),
+    {
+        Rels { m: Map::tracked_empty() }
+    }
+
+    /// The records are release records ([`rec_ok`]).
+    pub proof fn lemma_ok(tracked &self)
+        ensures
+            rec_ok(self.map()),
+    {
+        use_type_invariant(self);
+    }
+
+    /// Add the records of `more`, which replace any of the same address.
+    pub proof fn absorb(tracked &mut self, tracked more: Map<int, RelRec>)
+        requires
+            rec_ok(more),
+        ensures
+            final(self).map() == old(self).map().union_prefer_right(more),
+    {
+        use_type_invariant(&*self);
+        self.m.tracked_union_prefer_right(more);
+        assert(rec_ok(self.m)) by {
+            let m = self.m;
+            assert forall|a: int| #[trigger] m.contains_key(a) implies released(m[a].s, m[a].w, bit_of(m[a].s, a)) by {
+                if more.contains_key(a) {
+                    assert(m[a] == more[a]);
+                }
+            }
+        }
+    }
+
+    /// The record at `a`.
+    pub proof fn tracked_get(tracked &self, a: int) -> (tracked r: &RelRec)
+        requires
+            self.map().contains_key(a),
+        ensures
+            *r == self.map()[a],
+            released(r.s, r.w, bit_of(r.s, a)),
+    {
+        use_type_invariant(self);
+        self.m.tracked_borrow(a)
+    }
+}
+
 /// Record a copy of `w` under every bit of `bits` in `rel`, which keeps
 /// its other entries (a release's witness, for each slot it released).
 pub proof fn lemma_record(tracked rel: &mut Map<int, SeenWitness>, tracked w: &SeenWitness, bits: Set<int>)
