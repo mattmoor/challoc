@@ -5837,6 +5837,7 @@ impl ClassState {
         count: usize,
         reopen: &mut Reopen,
         Tracked(toks): Tracked<&mut GhostSubset<int>>,
+        Tracked(rel): Tracked<&mut Map<int, crate::bitmap::SeenWitness>>,
         pubw: Tracked<&'static Published>,
         Tracked(ord): Tracked<&mut LockOrder>,
     )
@@ -5864,6 +5865,11 @@ impl ClassState {
             *final(ord) == *old(ord),
             final(toks).id() == old(toks).id(),
             final(toks)@.is_empty(),
+            // Each released slot's bit has its release's witness (#843).
+            forall|b: int| #[trigger] scratch_bits(self.spec_table().spec_slots(), slab * self.spec_table().spec_slots().sb, old(local)@, lo as int, hi as int).contains(b)
+                ==> final(rel).contains_key(b) && crate::bitmap::released(self.spec_table().spec_slots(), final(rel)[b], b),
+            forall|b: int| !scratch_bits(self.spec_table().spec_slots(), slab * self.spec_table().spec_slots().sb, old(local)@, lo as int, hi as int).contains(b)
+                && #[trigger] old(rel).contains_key(b) ==> final(rel).contains_key(b) && final(rel)[b] == old(rel)[b],
     {
         let ghost s = self.spec_table().spec_slots();
         let ghost f = slab * s.sb;
@@ -5872,6 +5878,9 @@ impl ClassState {
             use_type_invariant(self);
             self.spec_table().lemma_slots_wf();
         }
+        let ghost rel0 = *rel;
+        let ghost l0 = local@;
+        let ghost mut upto: int = lo - 1;
         for w in it: lo..=hi
             invariant
                 crate::sys::may_abort() || crate::sys::valid_aborts(),
@@ -5894,6 +5903,13 @@ impl ClassState {
                 f == slab * s.sb,
                 toks.id() == s.loc,
                 toks@ == addrs(s, scratch_bits(s, f, old(local)@, lo + it.index(), hi as int)),
+                l0 == old(local)@,
+                rel0 == *old(rel),
+                upto == lo + it.index() - 1,
+                forall|b: int| #[trigger] scratch_bits(s, f, l0, lo as int, upto).contains(b)
+                    ==> rel.contains_key(b) && crate::bitmap::released(s, rel[b], b),
+                forall|b: int| !scratch_bits(s, f, l0, lo as int, upto).contains(b)
+                    && #[trigger] rel0.contains_key(b) ==> rel.contains_key(b) && rel[b] == rel0[b],
         {
             let ghost i = lo + it.index();
             proof {
@@ -5907,10 +5923,43 @@ impl ClassState {
             }
             let mask = local[w];
             let tracked mut tok = toks.split(word_addrs(self.spec_table(), slab as int, w as int, mask));
+            let ghost r1 = *rel;
             if mask != 0 {
                 local[w] = 0;
-                let tracked mut rel = Map::tracked_empty();
-                self.release_word(slab, w, mask, reopen, Tracked(&mut tok), Tracked(&mut rel), pubw, Tracked(ord));
+                self.release_word(slab, w, mask, reopen, Tracked(&mut tok), Tracked(rel), pubw, Tracked(ord));
+            } else {
+                proof {
+                    assert forall|b: u64| b < 64 implies !#[trigger] has_bit(0u64, b) by {
+                        assert((0u64 >> b) & 1u64 != 1u64) by (bit_vector);
+                    }
+                }
+            }
+            proof {
+                // Word `i`'s bits are its mask's (`mask_bits`), added to
+                // the words before it.
+                broadcast use {vstd::set_lib::range_set_properties, vstd::set::lemma_set_filter};
+                let a = mask_bits(s, f, i, l0[i]);
+                assert forall|b: int| #[trigger] scratch_bits(s, f, l0, lo as int, i).contains(b)
+                    == (scratch_bits(s, f, l0, lo as int, upto).contains(b) || a.contains(b)) by {
+                    if f + 64 * i <= b < f + 64 * i + 64 {
+                        assert((b - f) / 64 == i);
+                        assert((b - f) % 64 == b - f - 64 * i);
+                    }
+                }
+                assert forall|b: int| #[trigger] scratch_bits(s, f, l0, lo as int, i).contains(b)
+                    implies rel.contains_key(b) && crate::bitmap::released(s, rel[b], b) by {
+                    if !a.contains(b) {
+                        assert(scratch_bits(s, f, l0, lo as int, upto).contains(b));
+                        assert(r1.contains_key(b));
+                    }
+                }
+                assert forall|b: int| !scratch_bits(s, f, l0, lo as int, i).contains(b)
+                    && #[trigger] rel0.contains_key(b) implies rel.contains_key(b) && rel[b] == rel0[b] by {
+                    assert(!scratch_bits(s, f, l0, lo as int, upto).contains(b));
+                    assert(!a.contains(b));
+                    assert(r1.contains_key(b));
+                }
+                upto = i;
             }
         }
         self.dec_live(slab, count, pubw, Tracked(ord));
@@ -6020,6 +6069,7 @@ impl ClassState {
         let (mut lo_w, mut hi_w) = (usize::MAX, 0usize);
         let mut count = 0usize;
         let mut reopen = Reopen::new();
+        let tracked mut rel: Map<int, crate::bitmap::SeenWitness> = Map::tracked_empty();
         let mut end = ptrs.len();
         let ghost sb = class_table()[self.spec_class() as int].slab_bits as usize;
         let ghost nslots = class_table()[self.spec_class() as int].nslots as int;
@@ -6113,7 +6163,7 @@ impl ClassState {
             if slab != cur_slab {
                 if count != 0 {
                     let ghost pre = local@;
-                    self.release_slab(cur_slab, &mut local, lo_w, hi_w, count, &mut reopen, Tracked(&mut ltoks), pubw, Tracked(ord));
+                    self.release_slab(cur_slab, &mut local, lo_w, hi_w, count, &mut reopen, Tracked(&mut ltoks), Tracked(&mut rel), pubw, Tracked(ord));
                     proof {
                         assert forall|v: int| 0 <= v < MAX_SLAB_WORDS implies subset(#[trigger] local@[v], slab_mask_of(sb)) by {
                             let m = slab_mask_of(sb);
@@ -6276,7 +6326,7 @@ impl ClassState {
             i += 1;
         }
         if count != 0 {
-            self.release_slab(cur_slab, &mut local, lo_w, hi_w, count, &mut reopen, Tracked(&mut ltoks), pubw, Tracked(ord));
+            self.release_slab(cur_slab, &mut local, lo_w, hi_w, count, &mut reopen, Tracked(&mut ltoks), Tracked(&mut rel), pubw, Tracked(ord));
         }
         self.reopen(&mut reopen, pubw, Tracked(ord));
         if end != 0 {
