@@ -621,6 +621,8 @@ impl Heap {
             shared.release_routed(owner, class, high, Tracked(&mut bag), Tracked(&mut rel), Tracked(ord));
             proof {
                 perms.rels.absorb(rel);
+                // Every released slot has a record for its next free's check.
+                assert(forall|j: int| 0 <= j < high@.len() ==> #[trigger] perms.rels.map().contains_key(ptr_addrs(high@)[j]));
                 // Every cached slot is kept or released.
                 let hr = ptr_addrs(high@);
                 lemma_flush_split(aold, akept, ptr_addrs(h1), hr);

@@ -844,7 +844,8 @@ proof fn lemma_check_after_release(t: SlabTable, slab: int, slot: int, l0: BitLo
             broadcast use Set::lemma_map_contains;
         }
     }
-    lemma_claimed_again(l0, l1, s.hloc, j, k);
+    // Then `l0`'s version is below `l1`'s, as in `lemma_claimed_again`
+    // (`BitLoad::after` at word `j`).
 }
 
 /// The bit test's record `l` found the slot at address `a` allocated in
