@@ -6051,6 +6051,8 @@ impl SlabTable {
             // with the slot's token not among the word's at the load.
             ((x >> (bit % 64)) & 1 != 0) == !slot_free_at(final(obs).toks(), self.spec_class() as int, slab as int, slot as int),
             self.load_seen(slab as int, slot as int, *final(obs)),
+            // No older than what `obs` held (a release's record, #843).
+            self.load_after(slab as int, slot as int, *old(obs), *final(obs)),
         opens_invariants [crate::bitmap::word_ns()]
     {
         let tracked none = None;
