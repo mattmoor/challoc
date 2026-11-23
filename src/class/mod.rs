@@ -5582,7 +5582,20 @@ impl ClassState {
     /// (`AtomicBitmap::release`).
     // The extra arguments are ghost and tracked state.
     #[allow(clippy::too_many_arguments)]
-    fn release_word(&self, slab: usize, word: usize, mask: u64, reopen: &mut Reopen, Tracked(tok): Tracked<&mut GhostSubset<int>>, pubw: Tracked<&'static Published>, Tracked(ord): Tracked<&mut LockOrder>)
+    // Own prover: with the witness record (#843) in the module's shared
+    // Z3 context, `take`'s slab-address assert fails.
+    #[verifier::spinoff_prover]
+    fn release_word(
+        &self,
+        slab: usize,
+        word: usize,
+        mask: u64,
+        reopen: &mut Reopen,
+        Tracked(tok): Tracked<&mut GhostSubset<int>>,
+        Tracked(rel): Tracked<&mut Map<int, crate::bitmap::SeenWitness>>,
+        pubw: Tracked<&'static Published>,
+        Tracked(ord): Tracked<&mut LockOrder>,
+    )
         requires
             crate::sys::may_abort() || crate::sys::valid_aborts(),
             crate::sys::may_syscall(),
@@ -5602,6 +5615,11 @@ impl ClassState {
             *final(ord) == *old(ord),
             final(tok).id() == old(tok).id(),
             final(tok)@.is_empty(),
+            // Each released slot's bit has the release's witness (#843).
+            forall|b: int| #[trigger] mask_bits(self.spec_table().spec_slots(), slab * self.spec_table().spec_slots().sb, word as int, mask).contains(b)
+                ==> final(rel).contains_key(b) && crate::bitmap::released(self.spec_table().spec_slots(), final(rel)[b], b),
+            forall|b: int| !mask_bits(self.spec_table().spec_slots(), slab * self.spec_table().spec_slots().sb, word as int, mask).contains(b)
+                && #[trigger] old(rel).contains_key(b) ==> final(rel).contains_key(b) && final(rel)[b] == old(rel)[b],
     {
         let ghost sb = class_table()[self.spec_class() as int].slab_bits as usize;
         proof {
@@ -5620,7 +5638,11 @@ impl ClassState {
                 t.lemma_slot_bit(slab as int, 64 * word + b);
             }
         }
-        let (prev, was_full, _) = bm.release(word, mask, Tracked(tok));
+        let (prev, was_full, wit) = bm.release(word, mask, Tracked(tok));
+        proof {
+            broadcast use {vstd::set_lib::range_set_properties, vstd::set::lemma_set_filter};
+            crate::bitmap::lemma_record(rel, wit.borrow(), bm.tokens(word as int, mask));
+        }
         if prev & mask != mask {
             proof {
                 // The released slots' bits were set: `tok` holds their
@@ -5887,7 +5909,8 @@ impl ClassState {
             let tracked mut tok = toks.split(word_addrs(self.spec_table(), slab as int, w as int, mask));
             if mask != 0 {
                 local[w] = 0;
-                self.release_word(slab, w, mask, reopen, Tracked(&mut tok), pubw, Tracked(ord));
+                let tracked mut rel = Map::tracked_empty();
+                self.release_word(slab, w, mask, reopen, Tracked(&mut tok), Tracked(&mut rel), pubw, Tracked(ord));
             }
         }
         self.dec_live(slab, count, pubw, Tracked(ord));

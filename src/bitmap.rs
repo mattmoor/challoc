@@ -1318,6 +1318,7 @@ impl<'a> AtomicBitmap<'a> {
             r.2@.id() == self.spec_slots().hloc,
             r.2@@.0 == self.spec_first() / 64 + i,
             forall|b: u64| b < 64 && #[trigger] has_bit(mask, b) ==> !has_bit(r.2@@.2, (self.spec_first() % 64 + b) as u64),
+            forall|b: int| #[trigger] self.tokens(i as int, mask).contains(b) ==> released(self.spec_slots(), r.2@, b),
             subset(r.0, self.slab_mask()),
             r.1 == (r.0 == self.slab_mask()),
             subset(mask, r.0),
@@ -1428,6 +1429,22 @@ impl<'a> AtomicBitmap<'a> {
             lemma_subset_bits(m, prev);
             assert(subset(mask, (prev & sm) >> s)) by (bit_vector)
                 requires m & !prev == 0u64, m == mask << s, mask & !(sm >> s) == 0u64, (sm >> s) << s == sm, s < 64;
+            // Each released slot's bit `first + 64 * i + t` is bit
+            // `first % 64 + t` of word `first / 64 + i`, the witness's.
+            broadcast use {vstd::set_lib::range_set_properties, vstd::set::lemma_set_filter};
+            let f = self.first@;
+            assert forall|b: int| #[trigger] self.tokens(i as int, mask).contains(b) implies released(self.slots@, wr, b) by {
+                let t = (b - f - 64 * i) as u64;
+                assert(has_bit(mask, t));
+                let su = s as u64;
+                assert(t + su < 64) by (bit_vector)
+                    requires (mask >> t) & 1u64 == 1u64, mask & !(sm >> su) == 0u64, su < 64, t < 64;
+                assert(f % 64 == s as int);
+                assert(b == 64 * (f / 64 + i) + (f % 64 + t)) by (nonlinear_arith)
+                    requires b == f + 64 * i + t, f == 64 * (f / 64) + f % 64;
+                assert(b / 64 == f / 64 + i && b % 64 == f % 64 + t) by (nonlinear_arith)
+                    requires b == 64 * (f / 64 + i) + (f % 64 + t), 0 <= f % 64 + t < 64;
+            }
         }
         ((prev & self.mask) >> self.shift, prev & self.mask == self.mask, Tracked(wr))
     }
@@ -3699,6 +3716,39 @@ pub type SeenVals = (GhostISubset<(int, nat, u64)>, GhostPersistentISubset<(int,
 /// A witness of a bitmap word's seen value: the persistent `(j, n, x)`
 /// at the class bitmap's `hloc` (above).
 pub type SeenWitness = GhostPersistentISingleton<(int, nat, u64)>;
+
+/// `w` witnesses a value of the word of class bitmap bit `b` (of `s`) in
+/// which the bit is clear: the record a release of `b`'s slot leaves
+/// ([`AtomicBitmap::release`]), which a later check of the slot is
+/// ordered after (#843).
+pub open spec fn released(s: Slots, w: SeenWitness, b: int) -> bool {
+    &&& w.id() == s.hloc
+    &&& w@.0 == b / 64
+    &&& !has_bit(w@.2, (b % 64) as u64)
+}
+
+/// Record a copy of `w` under every bit of `bits` in `rel`, which keeps
+/// its other entries (a release's witness, for each slot it released).
+pub proof fn lemma_record(tracked rel: &mut Map<int, SeenWitness>, tracked w: &SeenWitness, bits: Set<int>)
+    ensures
+        forall|b: int| #[trigger] bits.contains(b) ==> final(rel).contains_key(b) && final(rel)[b] == *w,
+        forall|b: int| !bits.contains(b) && #[trigger] old(rel).contains_key(b) ==> final(rel).contains_key(b) && final(rel)[b] == old(rel)[b],
+    decreases bits.len(),
+{
+    if bits.len() > 0 {
+        if !(exists|b: int| bits.contains(b)) {
+            assert(bits =~= Set::empty());
+        }
+        let b = choose|b: int| bits.contains(b);
+        let tracked c = w.duplicate();
+        rel.tracked_insert(b, c);
+        let ghost mid = *rel;
+        lemma_record(rel, w, bits.remove(b));
+        assert(rel.contains_key(b) && rel[b] == mid[b]);
+    } else {
+        assert(bits =~= Set::empty());
+    }
+}
 
 /// Word `k.j`'s seen values, as its invariant holds them (`h`) for its
 /// value `x`: both parts at `k.slots.hloc`, every versioned value of the
