@@ -11079,7 +11079,7 @@ Codes: `P` proved, `p` partial, `-` missing, `.` not applicable.
 | 12 | `challoc_malloc_usable`                     | P | P | . | . | P | . | P |
 | 13 | `challoc_calloc_usable`                     | P | P | P | . | P | . | P |
 | 14 | `challoc_realloc_usable`                    | P | P | . | p | P | p | P |
-| 15 | `challoc_free_usable`                       | . | . | . | . | P | p | P |
+| 15 | `challoc_free_usable`                       | . | . | . | . | P | p | p |
 | 16 | `mallocx`                                   | P | P | P | . | p | p | . |
 | 17 | `rallocx`                                   | P | P | P | p | p | p | . |
 | 18 | `xallocx`                                   | . | . | . | . | . | p | p |
@@ -11227,8 +11227,13 @@ Notes that recur below:
   queries (`malloc_usable_size`, `sallocx`, `xallocx`) take no token, so
   their huge half is not tied to the request: `p` for rows 9, 18 and 19.
   `challoc_free_usable`'s core returns the token its check claimed as a
-  ghost result and states `r == blk.len()` of it, so row 15 is `P`
-  ([#892](https://github.com/chainguard-project-theseus/challoc/issues/892)). The allocating `_usable` entry points are
+  ghost result and states `r == blk.len()` of it
+  ([#892](https://github.com/chainguard-project-theseus/challoc/issues/892)),
+  but row 15 is `p`: the result is a copy of the token's value, and read
+  alone `r == blk.len()` is met by the length of any well-formed run at
+  `p`, close to `usable_of`'s shape. That the copy is the token the check
+  claimed is in the proofs (mutants F1, F2), not in the `ensures` a
+  client reads (#895). The allocating `_usable` entry points are
   `.0` of `_stored` twins (`malloc_usable_stored`,
   `realloc_usable_stored`; `calloc_usable_zeroed`'s third result) that
   return the `Stored` token of `store_usable` (verified: it writes through
@@ -11697,6 +11702,10 @@ What each partial or missing cell leaves out, and what it rests on:
   `P` cells (rows 10, 11, 15, 26-28) and the unchanged `errno` of rows
   20 and 21 rest on the premise that no libc call in trusted code on
   their paths leaves `errno` changed (*(errno)*).
+- **U** (row 15): `challoc_free_usable`'s huge half states `r ==
+  blk.len()` of a ghost copy of the token its check claimed; a client of
+  the `ensures` cannot tell that copy from any well-formed run token at
+  `p`, so the cell is `p` (see the `usable_size` note above).
 - **U** (rows 9, 18, 19): the huge half of a query. `usable_size` with
   the block's run token gives exactly its usable bytes, but the queries
   take no token (giving them one would add an `axiom_c_claim` site for a
