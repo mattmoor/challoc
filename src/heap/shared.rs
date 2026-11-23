@@ -3924,8 +3924,17 @@ impl Shared {
     ///
     /// [`release_owned`]: crate::class::ClassState::release_owned
     /// [`slot_owner`]: crate::class::slot_owner
-    pub fn release_routed(&self, arena: u16, class: usize, ptrs: &[*mut u8], Tracked(bag): Tracked<&mut GhostSubset<int>>, Tracked(ord): Tracked<&mut LockOrder>)
+    pub fn release_routed(
+        &self,
+        arena: u16,
+        class: usize,
+        ptrs: &[*mut u8],
+        Tracked(bag): Tracked<&mut GhostSubset<int>>,
+        Tracked(rel): Tracked<&mut vstd::map::Map<int, crate::bitmap::RelRec>>,
+        Tracked(ord): Tracked<&mut LockOrder>,
+    )
         requires
+            crate::bitmap::rec_ok(*old(rel)),
             crate::sys::may_abort() || (crate::sys::valid_aborts() && crate::class::live_slots(class as int, ptrs@)),
             crate::sys::may_syscall(),
             old(ord).allows(rank_class(0, 0)),
@@ -3938,9 +3947,14 @@ impl Shared {
             final(bag).id() == old(bag).id(),
             final(bag)@ == old(bag)@ - aset(ptr_addrs(ptrs@), 0, ptrs@.len() as int),
             *final(ord) == *old(ord),
+            // Each released slot has its release's record (#843).
+            crate::bitmap::rec_ok(*final(rel)),
+            forall|a: int| #[trigger] old(rel).contains_key(a) ==> final(rel).contains_key(a),
+            forall|j: int| 0 <= j < ptrs@.len() ==> #[trigger] final(rel).contains_key(ptr_addrs(ptrs@)[j]),
     {
         broadcast use crate::class::lemma_aset;
         let ghost pa = ptr_addrs(ptrs@);
+        let ghost rel0 = *rel;
         let mut done = 0;
         let mut a = arena;
         proof {
@@ -3962,6 +3976,10 @@ impl Shared {
                 bag@ == old(bag)@ - aset(pa, 0, done as int),
                 aset(pa, done as int, ptrs@.len() as int) <= bag@,
                 distinct(pa, 0, ptrs@.len() as int),
+                rel0 == *old(rel),
+                crate::bitmap::rec_ok(*rel),
+                forall|a: int| #[trigger] rel0.contains_key(a) ==> rel.contains_key(a),
+                forall|j: int| 0 <= j < done ==> #[trigger] rel.contains_key(pa[j]),
             decreases
                 2 * (ptrs@.len() - done) + if done < ptrs@.len()
                     && crate::class::slot_owner(class as int, ptrs@[done as int]@.addr) != a { 1int } else { 0int },
@@ -3987,10 +4005,27 @@ impl Shared {
             proof {
                 self.lemma_published_tables(*ow@, *oa);
             }
-            // The release witnesses (#843) are per arena's table; none is
-            // kept here yet.
-            let tracked mut rel: vstd::map::Map<int, crate::bitmap::SeenWitness> = vstd::map::Map::tracked_empty();
-            done += oa.class(class).release_owned(&ptrs[done..], Tracked(&mut *bag), Tracked(&mut rel), ow, Tracked(ord));
+            // The release witnesses (#843), by bit of `oa`'s table, then
+            // by address into `rel`.
+            let tracked mut bits: vstd::map::Map<int, crate::bitmap::SeenWitness> = vstd::map::Map::tracked_empty();
+            let ghost r1 = *rel;
+            let cs = oa.class(class);
+            done += cs.release_owned(&ptrs[done..], Tracked(&mut *bag), Tracked(&mut bits), ow, Tracked(ord));
+            proof {
+                let s = cs.spec_table().spec_slots();
+                let r = done - d0;
+                crate::bitmap::lemma_by_addr(rel, &bits, s, ra, 0, r);
+                assert forall|j: int| 0 <= j < done implies #[trigger] rel.contains_key(pa[j]) by {
+                    if j < d0 {
+                        assert(r1.contains_key(pa[j]));
+                    } else {
+                        assert(rel.contains_key(ra[j - d0]));
+                    }
+                }
+                assert forall|a: int| #[trigger] rel0.contains_key(a) implies rel.contains_key(a) by {
+                    assert(r1.contains_key(a));
+                }
+            }
             proof {
                 let r = done - d0;
                 crate::class::lemma_aset_split(pa, d0, done as int, ptrs@.len() as int);

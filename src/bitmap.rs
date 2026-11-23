@@ -3766,6 +3766,64 @@ pub open spec fn rel_ok(s: Slots, rel: Map<int, SeenWitness>) -> bool {
     forall|b: int| #[trigger] rel.contains_key(b) ==> released(s, rel[b], b)
 }
 
+/// A release record of a slot, by address (#843): the witness of the word
+/// value its release left, and the geometry of the class table it was
+/// released to (an arena's: bits are relative to it).
+#[cfg_attr(not(verus_keep_ghost), allow(dead_code))]
+pub tracked struct RelRec {
+    pub tracked w: SeenWitness,
+    pub ghost s: Slots,
+}
+
+/// Every entry of `m` is a release record of the slot at its key.
+pub open spec fn rec_ok(m: Map<int, RelRec>) -> bool {
+    forall|a: int| #[trigger] m.contains_key(a) ==> released(m[a].s, m[a].w, bit_of(m[a].s, a))
+}
+
+/// Record, under the address `pa[j]` of each `lo <= j < hi`, a copy of the
+/// witness `bits` (by bit, of geometry `s`) holds for its slot's bit.
+pub proof fn lemma_by_addr(tracked out: &mut Map<int, RelRec>, tracked bits: &Map<int, SeenWitness>, s: Slots, pa: Seq<int>, lo: int, hi: int)
+    requires
+        rec_ok(*old(out)),
+        rel_ok(s, *bits),
+        forall|j: int| lo <= j < hi ==> #[trigger] bits.contains_key(bit_of(s, pa[j])),
+    ensures
+        rec_ok(*final(out)),
+        forall|a: int| #[trigger] old(out).contains_key(a) ==> final(out).contains_key(a) && (final(out)[a] == old(out)[a] || final(out)[a].s == s),
+        forall|j: int| lo <= j < hi ==> #[trigger] final(out).contains_key(pa[j]) && final(out)[pa[j]].s == s,
+    decreases hi - lo,
+{
+    if lo < hi {
+        let ghost o0 = *out;
+        let a = pa[lo];
+        assert(bits.contains_key(bit_of(s, pa[lo])));
+        let tracked w = bits.tracked_borrow(bit_of(s, a)).duplicate();
+        out.tracked_insert(a, RelRec { w, s });
+        let ghost mid = *out;
+        assert(rec_ok(mid)) by {
+            assert forall|x: int| #[trigger] mid.contains_key(x) implies released(mid[x].s, mid[x].w, bit_of(mid[x].s, x)) by {
+                if x != a {
+                    assert(o0.contains_key(x));
+                }
+            }
+        }
+        lemma_by_addr(out, bits, s, pa, lo + 1, hi);
+        assert forall|j: int| lo <= j < hi implies #[trigger] out.contains_key(pa[j]) && out[pa[j]].s == s by {
+            if j == lo {
+                assert(mid.contains_key(pa[lo]) && mid[pa[lo]].s == s);
+                assert(out.contains_key(pa[lo]));
+                assert(out[pa[lo]] == mid[pa[lo]] || out[pa[lo]].s == s);
+            } else {
+                assert(lo + 1 <= j < hi);
+                assert(out.contains_key(pa[j]));
+            }
+        }
+        assert forall|x: int| #[trigger] o0.contains_key(x) implies out.contains_key(x) && (out[x] == o0[x] || out[x].s == s) by {
+            assert(mid.contains_key(x));
+        }
+    }
+}
+
 /// Record a copy of `w` under every bit of `bits` in `rel`, which keeps
 /// its other entries (a release's witness, for each slot it released).
 pub proof fn lemma_record(tracked rel: &mut Map<int, SeenWitness>, tracked w: &SeenWitness, bits: Set<int>)
