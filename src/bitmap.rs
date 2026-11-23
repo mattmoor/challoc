@@ -3727,12 +3727,18 @@ pub open spec fn released(s: Slots, w: SeenWitness, b: int) -> bool {
     &&& !has_bit(w@.2, (b % 64) as u64)
 }
 
+/// Every entry of `rel` is a release record of its bit ([`released`]).
+pub open spec fn rel_ok(s: Slots, rel: Map<int, SeenWitness>) -> bool {
+    forall|b: int| #[trigger] rel.contains_key(b) ==> released(s, rel[b], b)
+}
+
 /// Record a copy of `w` under every bit of `bits` in `rel`, which keeps
 /// its other entries (a release's witness, for each slot it released).
 pub proof fn lemma_record(tracked rel: &mut Map<int, SeenWitness>, tracked w: &SeenWitness, bits: Set<int>)
     ensures
         forall|b: int| #[trigger] bits.contains(b) ==> final(rel).contains_key(b) && final(rel)[b] == *w,
         forall|b: int| !bits.contains(b) && #[trigger] old(rel).contains_key(b) ==> final(rel).contains_key(b) && final(rel)[b] == old(rel)[b],
+        forall|b: int| #[trigger] final(rel).contains_key(b) ==> bits.contains(b) || old(rel).contains_key(b),
     decreases bits.len(),
 {
     if bits.len() > 0 {

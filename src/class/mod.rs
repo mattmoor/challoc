@@ -5616,10 +5616,10 @@ impl ClassState {
             final(tok).id() == old(tok).id(),
             final(tok)@.is_empty(),
             // Each released slot's bit has the release's witness (#843).
+            crate::bitmap::rel_ok(self.spec_table().spec_slots(), *old(rel)) ==> crate::bitmap::rel_ok(self.spec_table().spec_slots(), *final(rel)),
             forall|b: int| #[trigger] mask_bits(self.spec_table().spec_slots(), slab * self.spec_table().spec_slots().sb, word as int, mask).contains(b)
-                ==> final(rel).contains_key(b) && crate::bitmap::released(self.spec_table().spec_slots(), final(rel)[b], b),
-            forall|b: int| !mask_bits(self.spec_table().spec_slots(), slab * self.spec_table().spec_slots().sb, word as int, mask).contains(b)
-                && #[trigger] old(rel).contains_key(b) ==> final(rel).contains_key(b) && final(rel)[b] == old(rel)[b],
+                ==> final(rel).contains_key(b),
+            forall|b: int| #[trigger] old(rel).contains_key(b) ==> final(rel).contains_key(b),
     {
         let ghost sb = class_table()[self.spec_class() as int].slab_bits as usize;
         proof {
@@ -5641,7 +5641,16 @@ impl ClassState {
         let (prev, was_full, wit) = bm.release(word, mask, Tracked(tok));
         proof {
             broadcast use {vstd::set_lib::range_set_properties, vstd::set::lemma_set_filter};
+            let ghost r0 = *rel;
             crate::bitmap::lemma_record(rel, wit.borrow(), bm.tokens(word as int, mask));
+            let sl = self.spec_table().spec_slots();
+            if crate::bitmap::rel_ok(sl, r0) {
+                assert forall|b: int| #[trigger] rel.contains_key(b) implies crate::bitmap::released(sl, rel[b], b) by {
+                    if !bm.tokens(word as int, mask).contains(b) {
+                        assert(r0.contains_key(b));
+                    }
+                }
+            }
         }
         if prev & mask != mask {
             proof {
@@ -5866,10 +5875,10 @@ impl ClassState {
             final(toks).id() == old(toks).id(),
             final(toks)@.is_empty(),
             // Each released slot's bit has its release's witness (#843).
+            crate::bitmap::rel_ok(self.spec_table().spec_slots(), *old(rel)) ==> crate::bitmap::rel_ok(self.spec_table().spec_slots(), *final(rel)),
             forall|b: int| #[trigger] scratch_bits(self.spec_table().spec_slots(), slab * self.spec_table().spec_slots().sb, old(local)@, lo as int, hi as int).contains(b)
-                ==> final(rel).contains_key(b) && crate::bitmap::released(self.spec_table().spec_slots(), final(rel)[b], b),
-            forall|b: int| !scratch_bits(self.spec_table().spec_slots(), slab * self.spec_table().spec_slots().sb, old(local)@, lo as int, hi as int).contains(b)
-                && #[trigger] old(rel).contains_key(b) ==> final(rel).contains_key(b) && final(rel)[b] == old(rel)[b],
+                ==> final(rel).contains_key(b),
+            forall|b: int| #[trigger] old(rel).contains_key(b) ==> final(rel).contains_key(b),
     {
         let ghost s = self.spec_table().spec_slots();
         let ghost f = slab * s.sb;
@@ -5906,10 +5915,9 @@ impl ClassState {
                 l0 == old(local)@,
                 rel0 == *old(rel),
                 upto == lo + it.index() - 1,
-                forall|b: int| #[trigger] scratch_bits(s, f, l0, lo as int, upto).contains(b)
-                    ==> rel.contains_key(b) && crate::bitmap::released(s, rel[b], b),
-                forall|b: int| !scratch_bits(s, f, l0, lo as int, upto).contains(b)
-                    && #[trigger] rel0.contains_key(b) ==> rel.contains_key(b) && rel[b] == rel0[b],
+                crate::bitmap::rel_ok(s, rel0) ==> crate::bitmap::rel_ok(s, *rel),
+                forall|b: int| #[trigger] scratch_bits(s, f, l0, lo as int, upto).contains(b) ==> rel.contains_key(b),
+                forall|b: int| #[trigger] rel0.contains_key(b) ==> rel.contains_key(b),
         {
             let ghost i = lo + it.index();
             proof {
@@ -5946,17 +5954,13 @@ impl ClassState {
                         assert((b - f) % 64 == b - f - 64 * i);
                     }
                 }
-                assert forall|b: int| #[trigger] scratch_bits(s, f, l0, lo as int, i).contains(b)
-                    implies rel.contains_key(b) && crate::bitmap::released(s, rel[b], b) by {
+                assert forall|b: int| #[trigger] scratch_bits(s, f, l0, lo as int, i).contains(b) implies rel.contains_key(b) by {
                     if !a.contains(b) {
                         assert(scratch_bits(s, f, l0, lo as int, upto).contains(b));
                         assert(r1.contains_key(b));
                     }
                 }
-                assert forall|b: int| !scratch_bits(s, f, l0, lo as int, i).contains(b)
-                    && #[trigger] rel0.contains_key(b) implies rel.contains_key(b) && rel[b] == rel0[b] by {
-                    assert(!scratch_bits(s, f, l0, lo as int, upto).contains(b));
-                    assert(!a.contains(b));
+                assert forall|b: int| #[trigger] rel0.contains_key(b) implies rel.contains_key(b) by {
                     assert(r1.contains_key(b));
                 }
                 upto = i;
