@@ -277,23 +277,16 @@ impl Heap {
         let tracked mut claim = claim;
         // The bit test is ordered after this heap's release of `p`'s slot,
         // when one of its flushes recorded one (#843).
-        let ghost a = p@.addr as int;
-        let ghost had = self.perms@.rels.map().contains_key(a);
-        let ghost rec = self.perms@.rels.map()[a];
-        let tracked mut obs = if had {
-            let tracked r = self.perms.borrow().rels.tracked_get(a);
-            crate::class::BitLoad::of_release(r.w.duplicate())
-        } else {
-            crate::class::BitLoad::new()
-        };
-        match shared.classify_free_after(p, Tracked(&mut claim), Tracked(&mut obs)) {
+        let tracked mut obs = crate::class::BitLoad::new();
+        match shared.classify_free_after(p, Tracked(&mut claim), Tracked(&self.perms.borrow().rels), Tracked(&mut obs)) {
             Ok((class, arena)) => {
                 proof {
                     // A stale free of a slot this heap released passes only
                     // if the slot was claimed again since: the test read a
                     // newer version of its word than the release left.
-                    if had && rec.s == shared.spec_tables()[class as int].spec_slots() {
-                        assert(rec.w@.1 < obs.seen()->Some_0.1.1);
+                    let k = (class as int, p@.addr as int);
+                    if self.perms@.rels.map().contains_key(k) {
+                        assert(self.perms@.rels.map()[k].w@.1 < obs.seen()->Some_0.1.1);
                     }
                 }
                 let tracked blk = claim.held.tracked_unwrap();

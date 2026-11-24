@@ -356,6 +356,21 @@ impl Shared {
     {
     }
 
+    /// The process registry's arena 0's table of class `c`, whose geometry
+    /// release records carry ([`crate::bitmap::process_slots`], #843), is
+    /// this `Shared`'s.
+    pub(crate) proof fn lemma_process_slots(&self, c: int)
+        requires
+            self.wf(),
+            0 <= c < NCLASSES,
+        ensures
+            crate::bitmap::process_slots(c) == self.tables[c].spec_slots(),
+    {
+        self.lemma_wf_slow();
+        assert(self.arena0.spec_class_state(c).spec_table() == self.arena0.spec_class_state(0).spec_tables()[c].value());
+        assert(self.arena0.spec_class_state(0).spec_tables()[c].value() == self.tables[c]);
+    }
+
     /// The class states of an arena with the registry's arena 0's tables
     /// ([`same_tables`](crate::arena::same_tables)) have the process's
     /// tables ([`Arena::tables_process`]).
@@ -3303,26 +3318,37 @@ impl Shared {
             r matches Err(page) ==> crate::layout::process_regions().is_huge_block(p@.addr, 1)
                 && page == ((p@.addr - crate::layout::process_regions().huge_base) as usize) >> crate::layout::process_regions().lg_page,
     {
+        let tracked rels = crate::bitmap::Rels::tracked_empty();
         let tracked mut obs = crate::class::BitLoad::new();
-        self.classify_free_after(p, Tracked(claim), Tracked(&mut obs))
+        self.classify_free_after(p, Tracked(claim), Tracked(&rels), Tracked(&mut obs))
     }
 
-    /// [`Shared::classify_free`] with the bit test's load ordered after
-    /// `obs` (#843): when `obs` holds a release record of `p`'s slot (the
-    /// word value its release left, the slot's bit clear,
-    /// [`crate::bitmap::released_at`]), a slot that passes the test was
-    /// read at a strictly newer version of its word, so it was claimed
-    /// again after that release ([`SlabTable::claimed_since`]). `obs` is
-    /// left the test's record.
+    /// [`Shared::classify_free`] with the bit test's load ordered after the
+    /// release record `rels` holds of `p`'s slot, if any (#843): the record
+    /// of the class the classification finds, made in the process's table
+    /// of that class (the word value the release left, the slot's bit
+    /// clear, [`crate::bitmap::released_at`]). A slot that passes the test
+    /// was then read at a strictly newer version of its word, so it was
+    /// claimed again after that release ([`SlabTable::claimed_since`]).
+    /// `obs` is left the test's record.
     #[inline(always)]
-    pub fn classify_free_after(&self, p: *mut u8, Tracked(claim): Tracked<&mut Claim>, Tracked(obs): Tracked<&mut crate::class::BitLoad>) -> (r: Result<(usize, u16), usize>)
+    pub fn classify_free_after(
+        &self,
+        p: *mut u8,
+        Tracked(claim): Tracked<&mut Claim>,
+        Tracked(rels): Tracked<&crate::bitmap::Rels>,
+        Tracked(obs): Tracked<&mut crate::class::BitLoad>,
+    ) -> (r: Result<(usize, u16), usize>)
         requires
             crate::sys::may_abort() || (crate::sys::valid_aborts() && old(claim).held_block(p)),
             old(claim).claims(p),
             self.wf(),
         ensures
-            // A stale free that passes saw a later claim of its slot.
-            r matches Ok((c, _)) ==> self.spec_tables()[c as int].claimed_since(p@.addr as int, *old(obs), *final(obs)),
+            // A stale free that passes, of a slot `rels` has a release
+            // record of, read a newer version of its word than the
+            // release left: the slot was claimed again since.
+            r matches Ok((c, _)) ==> (rels.map().contains_key((c as int, p@.addr as int)) ==> rels.map()[(c as int, p@.addr as int)].w@.1
+                < final(obs).seen()->Some_0.1.1),
             r is Ok ==> final(claim).held is Some,
             final(claim).claims(p),
             old(claim).held is Some ==> *final(claim) == *old(claim),
@@ -3363,6 +3389,20 @@ impl Shared {
                 } else {
                     &none
                 };
+                // The test is ordered after `rels`' record of the slot in
+                // this class, when there is one.
+                let ghost key = (class as int, p@.addr as int);
+                let ghost had = rels.map().contains_key(key);
+                proof {
+                    let tracked seed = if had {
+                        let tracked rec = rels.tracked_get(key.0, key.1);
+                        crate::class::BitLoad::of_release(rec.w.duplicate())
+                    } else {
+                        crate::class::BitLoad::new()
+                    };
+                    *obs = seed;
+                }
+                let ghost o0 = *obs;
                 table.check_live(slab as usize, slot as usize, p as usize, Tracked(held), Tracked(&mut *obs));
                 proof {
                     // `check_live` returned: not a guard slab.
@@ -3378,6 +3418,14 @@ impl Shared {
                     let live = claim.held->0;
                     live.lemma_claimed_block(p);
                     live.lemma_claims_slot(p, class as int);
+                }
+                proof {
+                    if had {
+                        // The record's geometry is the table's, so its
+                        // word value is a release record there.
+                        self.lemma_process_slots(class as int);
+                        assert(table.claimed_since(p@.addr as int, o0, *obs));
+                    }
                 }
                 // SAFETY: `check_live` returned.
                 let arena = unsafe { table.located_owner(slab as usize, slot as usize, Tracked(claim.held.tracked_borrow().slot_ref())) };
@@ -3966,7 +4014,7 @@ impl Shared {
         class: usize,
         ptrs: &[*mut u8],
         Tracked(bag): Tracked<&mut GhostSubset<int>>,
-        Tracked(rel): Tracked<&mut vstd::map::Map<int, crate::bitmap::RelRec>>,
+        Tracked(rel): Tracked<&mut vstd::map::Map<(int, int), crate::bitmap::RelRec>>,
         Tracked(ord): Tracked<&mut LockOrder>,
     )
         requires
@@ -3983,10 +4031,11 @@ impl Shared {
             final(bag).id() == old(bag).id(),
             final(bag)@ == old(bag)@ - aset(ptr_addrs(ptrs@), 0, ptrs@.len() as int),
             *final(ord) == *old(ord),
-            // Each released slot has its release's record (#843).
+            // Each released slot has its release's record, by class and
+            // address (#843).
             crate::bitmap::rec_ok(*final(rel)),
-            forall|a: int| #[trigger] old(rel).contains_key(a) ==> final(rel).contains_key(a),
-            forall|j: int| 0 <= j < ptrs@.len() ==> #[trigger] final(rel).contains_key(ptr_addrs(ptrs@)[j]),
+            forall|k: (int, int)| #[trigger] old(rel).contains_key(k) ==> final(rel).contains_key(k),
+            forall|j: int| 0 <= j < ptrs@.len() ==> #[trigger] final(rel).contains_key((class as int, ptr_addrs(ptrs@)[j])),
     {
         broadcast use crate::class::lemma_aset;
         let ghost pa = ptr_addrs(ptrs@);
@@ -4014,8 +4063,8 @@ impl Shared {
                 distinct(pa, 0, ptrs@.len() as int),
                 rel0 == *old(rel),
                 crate::bitmap::rec_ok(*rel),
-                forall|a: int| #[trigger] rel0.contains_key(a) ==> rel.contains_key(a),
-                forall|j: int| 0 <= j < done ==> #[trigger] rel.contains_key(pa[j]),
+                forall|k: (int, int)| #[trigger] rel0.contains_key(k) ==> rel.contains_key(k),
+                forall|j: int| 0 <= j < done ==> #[trigger] rel.contains_key((class as int, pa[j])),
             decreases
                 2 * (ptrs@.len() - done) + if done < ptrs@.len()
                     && crate::class::slot_owner(class as int, ptrs@[done as int]@.addr) != a { 1int } else { 0int },
@@ -4050,16 +4099,19 @@ impl Shared {
             proof {
                 let s = cs.spec_table().spec_slots();
                 let r = done - d0;
-                crate::bitmap::lemma_by_addr(rel, &bits, s, ra, 0, r);
-                assert forall|j: int| 0 <= j < done implies #[trigger] rel.contains_key(pa[j]) by {
+                // `oa` is published: its table of the class is the process
+                // registry's arena 0's.
+                assert(oa.spec_class_state(class as int).spec_table() == crate::arena::process_arena0().spec_class_state(class as int).spec_table());
+                crate::bitmap::lemma_by_addr(rel, &bits, class as int, s, ra, 0, r);
+                assert forall|j: int| 0 <= j < done implies #[trigger] rel.contains_key((class as int, pa[j])) by {
                     if j < d0 {
-                        assert(r1.contains_key(pa[j]));
+                        assert(r1.contains_key((class as int, pa[j])));
                     } else {
-                        assert(rel.contains_key(ra[j - d0]));
+                        assert(rel.contains_key((class as int, ra[j - d0])));
                     }
                 }
-                assert forall|a: int| #[trigger] rel0.contains_key(a) implies rel.contains_key(a) by {
-                    assert(r1.contains_key(a));
+                assert forall|k: (int, int)| #[trigger] rel0.contains_key(k) implies rel.contains_key(k) by {
+                    assert(r1.contains_key(k));
                 }
             }
             proof {

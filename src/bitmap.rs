@@ -3772,31 +3772,42 @@ pub open spec fn rel_ok(s: Slots, rel: Map<int, SeenWitness>) -> bool {
     forall|b: int| #[trigger] rel.contains_key(b) ==> released(s, rel[b], b)
 }
 
-/// A release record of a slot, by address (#843): the witness of the word
-/// value its release left, and the geometry of the class table it was
-/// released to (an arena's: bits are relative to it).
+/// A release record of a slot, by class and address (#843): the witness
+/// of the word value its release left, and the geometry of the class
+/// table it was released to (an arena's: bits are relative to it).
 #[cfg_attr(not(verus_keep_ghost), allow(dead_code))]
 pub tracked struct RelRec {
     pub tracked w: SeenWitness,
     pub ghost s: Slots,
 }
 
-/// Every entry of `m` is a release record of the slot at its key.
-pub open spec fn rec_ok(m: Map<int, RelRec>) -> bool {
-    forall|a: int| #[trigger] m.contains_key(a) ==> released(m[a].s, m[a].w, bit_of(m[a].s, a))
+/// The geometry of class `c`'s table in the process registry's arena 0,
+/// which every published arena's class state has (`arena::same_tables`)
+/// and which is the `Shared`'s table of the class
+/// (`Shared::lemma_process_slots`).
+pub open(crate) spec fn process_slots(c: int) -> Slots {
+    crate::arena::process_arena0().spec_class_state(c).spec_table().spec_slots()
 }
 
-/// Record, under the address `pa[j]` of each `lo <= j < hi`, a copy of the
-/// witness `bits` (by bit, of geometry `s`) holds for its slot's bit.
-pub proof fn lemma_by_addr(tracked out: &mut Map<int, RelRec>, tracked bits: &Map<int, SeenWitness>, s: Slots, pa: Seq<int>, lo: int, hi: int)
+/// Every entry of `m` is a release record of the slot at its key's
+/// address, made in the process's table of its key's class.
+pub open(crate) spec fn rec_ok(m: Map<(int, int), RelRec>) -> bool {
+    forall|k: (int, int)| #[trigger] m.contains_key(k) ==> m[k].s == process_slots(k.0) && released(m[k].s, m[k].w, bit_of(m[k].s, k.1))
+}
+
+/// Record, under `(c, pa[j])` for each `lo <= j < hi`, a copy of the
+/// witness `bits` (by bit, of class `c`'s process geometry `s`) holds for
+/// its slot's bit.
+pub proof fn lemma_by_addr(tracked out: &mut Map<(int, int), RelRec>, tracked bits: &Map<int, SeenWitness>, c: int, s: Slots, pa: Seq<int>, lo: int, hi: int)
     requires
         rec_ok(*old(out)),
+        s == process_slots(c),
         rel_ok(s, *bits),
         forall|j: int| lo <= j < hi ==> #[trigger] bits.contains_key(bit_of(s, pa[j])),
     ensures
         rec_ok(*final(out)),
-        forall|a: int| #[trigger] old(out).contains_key(a) ==> final(out).contains_key(a) && (final(out)[a] == old(out)[a] || final(out)[a].s == s),
-        forall|j: int| lo <= j < hi ==> #[trigger] final(out).contains_key(pa[j]) && final(out)[pa[j]].s == s,
+        forall|k: (int, int)| #[trigger] old(out).contains_key(k) ==> final(out).contains_key(k),
+        forall|j: int| lo <= j < hi ==> #[trigger] final(out).contains_key((c, pa[j])),
     decreases hi - lo,
 {
     if lo < hi {
@@ -3804,38 +3815,36 @@ pub proof fn lemma_by_addr(tracked out: &mut Map<int, RelRec>, tracked bits: &Ma
         let a = pa[lo];
         assert(bits.contains_key(bit_of(s, pa[lo])));
         let tracked w = bits.tracked_borrow(bit_of(s, a)).duplicate();
-        out.tracked_insert(a, RelRec { w, s });
+        out.tracked_insert((c, a), RelRec { w, s });
         let ghost mid = *out;
         assert(rec_ok(mid)) by {
-            assert forall|x: int| #[trigger] mid.contains_key(x) implies released(mid[x].s, mid[x].w, bit_of(mid[x].s, x)) by {
-                if x != a {
-                    assert(o0.contains_key(x));
+            assert forall|k: (int, int)| #[trigger] mid.contains_key(k) implies mid[k].s == process_slots(k.0) && released(mid[k].s, mid[k].w, bit_of(mid[k].s, k.1)) by {
+                if k != (c, a) {
+                    assert(o0.contains_key(k));
                 }
             }
         }
-        lemma_by_addr(out, bits, s, pa, lo + 1, hi);
-        assert forall|j: int| lo <= j < hi implies #[trigger] out.contains_key(pa[j]) && out[pa[j]].s == s by {
+        lemma_by_addr(out, bits, c, s, pa, lo + 1, hi);
+        assert forall|j: int| lo <= j < hi implies #[trigger] out.contains_key((c, pa[j])) by {
             if j == lo {
-                assert(mid.contains_key(pa[lo]) && mid[pa[lo]].s == s);
-                assert(out.contains_key(pa[lo]));
-                assert(out[pa[lo]] == mid[pa[lo]] || out[pa[lo]].s == s);
+                assert(mid.contains_key((c, pa[lo])));
             } else {
                 assert(lo + 1 <= j < hi);
-                assert(out.contains_key(pa[j]));
             }
         }
-        assert forall|x: int| #[trigger] o0.contains_key(x) implies out.contains_key(x) && (out[x] == o0[x] || out[x].s == s) by {
-            assert(mid.contains_key(x));
+        assert forall|k: (int, int)| #[trigger] o0.contains_key(k) implies out.contains_key(k) by {
+            assert(mid.contains_key(k));
         }
     }
 }
 
-/// A heap's release records (#843), by address: every one is a release
-/// record of the slot at its key ([`rec_ok`]), by the type's invariant,
-/// so the heap's invariants need not carry it.
+/// A heap's release records (#843), by class and address: every one is a
+/// release record of the slot at its key, in the process's table of its
+/// class ([`rec_ok`]), by the type's invariant, so the heap's invariants
+/// need not carry it.
 #[cfg_attr(not(verus_keep_ghost), allow(dead_code))]
 pub tracked struct Rels {
-    tracked m: Map<int, RelRec>,
+    tracked m: Map<(int, int), RelRec>,
 }
 
 impl Rels {
@@ -3845,14 +3854,14 @@ impl Rels {
     }
 
     /// The records.
-    pub closed spec fn map(self) -> Map<int, RelRec> {
+    pub closed spec fn map(self) -> Map<(int, int), RelRec> {
         self.m
     }
 
     /// No records.
     pub proof fn tracked_empty() -> (tracked r: Rels)
         ensures
-            r.map() == Map::<int, RelRec>::empty(),
+            r.map() == Map::<(int, int), RelRec>::empty(),
     {
         Rels { m: Map::tracked_empty() }
     }
@@ -3865,8 +3874,8 @@ impl Rels {
         use_type_invariant(self);
     }
 
-    /// Add the records of `more`, which replace any of the same address.
-    pub proof fn absorb(tracked &mut self, tracked more: Map<int, RelRec>)
+    /// Add the records of `more`, which replace any of the same key.
+    pub proof fn absorb(tracked &mut self, tracked more: Map<(int, int), RelRec>)
         requires
             rec_ok(more),
         ensures
@@ -3876,24 +3885,26 @@ impl Rels {
         self.m.tracked_union_prefer_right(more);
         assert(rec_ok(self.m)) by {
             let m = self.m;
-            assert forall|a: int| #[trigger] m.contains_key(a) implies released(m[a].s, m[a].w, bit_of(m[a].s, a)) by {
-                if more.contains_key(a) {
-                    assert(m[a] == more[a]);
+            assert forall|k: (int, int)| #[trigger] m.contains_key(k) implies m[k].s == process_slots(k.0) && released(m[k].s, m[k].w, bit_of(m[k].s, k.1)) by {
+                if more.contains_key(k) {
+                    assert(m[k] == more[k]);
                 }
             }
         }
     }
 
-    /// The record at `a`.
-    pub proof fn tracked_get(tracked &self, a: int) -> (tracked r: &RelRec)
+    /// The record of the slot at address `a` of class `c`: made in the
+    /// process's table of the class.
+    pub proof fn tracked_get(tracked &self, c: int, a: int) -> (tracked r: &RelRec)
         requires
-            self.map().contains_key(a),
+            self.map().contains_key((c, a)),
         ensures
-            *r == self.map()[a],
+            *r == self.map()[(c, a)],
+            r.s == process_slots(c),
             released(r.s, r.w, bit_of(r.s, a)),
     {
         use_type_invariant(self);
-        self.m.tracked_borrow(a)
+        self.m.tracked_borrow((c, a))
     }
 }
 

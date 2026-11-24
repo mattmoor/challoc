@@ -617,12 +617,12 @@ impl Heap {
             // belongs; `release_routed` follows the owner words from there.
             let owner = if arena == FOREIGN { shared.arena_of_slot(class, *high.get_unchecked(0)) } else { arena };
             // The release records (#843), kept in the heap's `rels`.
-            let tracked mut rel: Map<int, crate::bitmap::RelRec> = Map::tracked_empty();
+            let tracked mut rel: Map<(int, int), crate::bitmap::RelRec> = Map::tracked_empty();
             shared.release_routed(owner, class, high, Tracked(&mut bag), Tracked(&mut rel), Tracked(ord));
             proof {
                 perms.rels.absorb(rel);
                 // Every released slot has a record for its next free's check.
-                assert(forall|j: int| 0 <= j < high@.len() ==> #[trigger] perms.rels.map().contains_key(ptr_addrs(high@)[j]));
+                assert(forall|j: int| 0 <= j < high@.len() ==> #[trigger] perms.rels.map().contains_key((class as int, ptr_addrs(high@)[j])));
                 // Every cached slot is kept or released.
                 let hr = ptr_addrs(high@);
                 lemma_flush_split(aold, akept, ptr_addrs(h1), hr);
