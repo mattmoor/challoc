@@ -828,7 +828,6 @@ pub open spec fn word_addrs(t: SlabTable, slab: int, word: int, x: u64) -> VSet<
     addrs(t.spec_slots(), mask_bits(t.spec_slots(), slab * t.spec_slots().sb, word, x))
 }
 
-/// The addresses of a set with one more slot.
 /// The slot at `a` has its release's witness in `rel`, or its token is in
 /// `held`, a batch's scratch words still to be released (#843).
 pub open spec fn rel_or(s: Slots, rel: Map<int, crate::bitmap::SeenWitness>, held: VSet<int>, a: int) -> bool {
@@ -868,6 +867,7 @@ proof fn lemma_rel_flush(
     }
 }
 
+/// The addresses of a set with one more slot.
 pub proof fn lemma_addrs_insert(s: Slots, a: VSet<int>, b: int)
     ensures
         addrs(s, a.insert(b)) == addrs(s, a).insert(s.addr(b)),
