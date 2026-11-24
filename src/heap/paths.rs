@@ -1030,6 +1030,8 @@ pub unsafe fn free_fast_slot(
         shared.wf(),
         old(claim).claims(p),
         slot_ok(old(tls).cell, old(tls).loan),
+        // The token's release records are its heap's (#912).
+        old(tls).rels_ok(),
         t == old(tls).value(),
         t > TLS_EXITED,
         tp == old(tls).tp(),
