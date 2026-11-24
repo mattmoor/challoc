@@ -429,6 +429,61 @@ fn a_marker_the_kernel_refuses_declines() {
     env.free(&h, c);
 }
 
+/// The kernel refuses the new guard's marker at the mark, after the
+/// growth committed the pages past it: the growth declines and returns
+/// those pages to `PROT_NONE`, so nothing above the mark is left
+/// read-write (and, `mlock`ed, resident) (#942).
+#[test]
+fn a_refused_marker_past_the_mark_leaves_nothing_committed_above_it() {
+    let env = Env::new();
+    let test = "huge::grow_tests::a_refused_marker_past_the_mark_leaves_nothing_committed_above_it";
+    let Some(h) = huge(&env, test) else {
+        return;
+    };
+    let ps = page_size();
+    let (a, _) = env.alloc(&h, ps, 1); // pages [0, 2), the mark at 2
+    fill(a, ps, 5);
+    let above = a as usize + 2 * ps;
+    // Pages [2, 6), reserved and `PROT_NONE`, locked as `mlockall` locks
+    // a new mapping. `mlock` would populate them and fails on `PROT_NONE`
+    // (`ENOMEM`); `MLOCK_ONFAULT` sets the same `VM_LOCKED`, which is what
+    // the marker refuses.
+    // SAFETY: `mlock2` only marks the pages locked; nothing is touched.
+    if unsafe { libc::mlock2(above as *const _, 4 * ps, libc::MLOCK_ONFAULT) } != 0 {
+        crate::testutil::skip(
+            test,
+            &std::format!("mlock2 failed: {}", std::io::Error::last_os_error()),
+        );
+        return;
+    }
+    // Pages [0, 5): the commit of [2, 5) goes through, and the new
+    // guard's marker on page 4 is refused.
+    assert_eq!(grow(&env, &h, a, 4 * ps), None);
+    assert_eq!(info(&env, &h, a), (ps, 2));
+    check(a, ps, 5);
+    assert_eq!(h.stats(Tracked::assume_new()).next_page, 2);
+    let rw: std::vec::Vec<std::string::String> = env
+        .huge_maps()
+        .into_iter()
+        .filter(|l| {
+            let range = l.split_whitespace().next().unwrap();
+            let (lo, hi) = range.split_once('-').unwrap();
+            let lo = usize::from_str_radix(lo, 16).unwrap();
+            let hi = usize::from_str_radix(hi, 16).unwrap();
+            lo < above + 3 * ps
+                && above < hi
+                && l.split_whitespace().nth(1).unwrap().starts_with("rw")
+        })
+        .collect();
+    assert!(
+        rw.is_empty(),
+        "got = read-write VMAs over the pages past the mark: {rw:?}; want = none"
+    );
+    // SAFETY: unlocking the test's own reserved pages; no memory is touched.
+    unsafe { libc::munlock(above as *const _, 4 * ps) };
+    env.free(&h, a);
+}
+
 /// Fork epochs (design 5): while the floors hold (`cow::in_force`), a run
 /// grows into the `Purged` extent behind it only while every purge so far
 /// was `MADV_DONTNEED` (`purge::purged_is_zero`); after a `MADV_FREE`

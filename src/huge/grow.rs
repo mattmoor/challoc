@@ -1313,6 +1313,19 @@ impl Huge {
                 self.lemma_pages((end - GUARD_PAGES) as usize);
             }
             if guard_install(self.addr(end - GUARD_PAGES), GUARD_PAGES * ps).is_err() {
+                // The pages committed past the mark go back to `PROT_NONE`:
+                // the mark stays, and nothing above it is read-write. A
+                // refused marker means `mlock`ed pages (`EINVAL`), which
+                // the commit populated and locked; left read-write, they
+                // would stay resident until runs reach them (#942). A
+                // failure leaves them read-write, as before this change.
+                if end > mark {
+                    proof {
+                        self.lemma_pages(mark);
+                        self.lemma_pages((end - mark) as usize);
+                    }
+                    let _ = protect_none(self.addr(mark), (end - mark) * ps);
+                }
                 proof {
                     assert(lock_frame(lock_init(self.inner), g@));
                 }
