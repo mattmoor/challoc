@@ -55,8 +55,8 @@ use crate::lock::LockOrder;
 #[cfg(verus_keep_ghost)]
 use crate::lock::rank_class;
 pub use crate::policy::Advice;
-use crate::sys;
 use crate::sync::patomic::PAtomicU8;
+use crate::sys;
 use crate::vspec::byte::BytePerm;
 use vstd::invariant::{AtomicInvariant, InvariantPredicate};
 use vstd::prelude::*;
