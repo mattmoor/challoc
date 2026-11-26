@@ -102,6 +102,12 @@ impl ClassState {
     /// discard left the parent no page to share, so a refill's writes copy
     /// none. With a floor, `None` may leave idle slabs below it.
     ///
+    /// The read goes through `mark`, the caller's record of the hold's
+    /// reads of `lz` ([`crate::purge::lazy`], the same reference for every
+    /// call of the hold; [`crate::purge::purged_is_zero_seen`]): once one
+    /// returned false, every later one does, so the floor the `Purged` set
+    /// is taken from ([`super::purged_floor`]) only rises within a hold.
+    ///
     /// [`purge::purged_is_zero`]: crate::purge::purged_is_zero
     #[inline(always)]
     pub(super) fn next_slab(
