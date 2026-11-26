@@ -12118,7 +12118,19 @@ rlimit.
 **Mutations** (`cargo verus focus --locked -- --verify-module class`,
 on the PR's tree and on its base):
 
-MUTANTS_TABLE
+| id | change | PR | base |
+|---|---|---|---|
+| M1 | `next_fresh_slab` drops "the slab lies in `[old cursor, new cursor)`" | rejected (`next_slab`'s new "`Fresh` exactly when the cursor passed it" `ensures`) | not applicable (no such clause) |
+| M2 | `next_slab` drops "`Fresh` exactly when the cursor passed it" | rejected (`lemma_fresh_step` precondition in `plan_at`) | not applicable (no such clause) |
+| M3 | `plan_at` drops `lemma_fresh_mono` where `next_slab` returns `None` | rejected (`plan_at`'s `fresh_ordered` `ensures`) | not applicable |
+
+M1 and M2 show the two new `ensures` are what carries the order through
+the hold; M3 shows a `None` from `next_slab` can move the cursor, which
+the hold's statement must allow. No executable mutant was found that the
+base accepts and this PR rejects: the lock invariant (the current
+group's remaining slabs are owned and `Fresh`, and a new group starts
+past every owned slab) already confines `next_fresh_slab` to the
+cursor's slab; this PR states it across the hold.
 
 ## Interface contract
 
